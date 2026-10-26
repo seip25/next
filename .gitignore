@@ -1,0 +1,16 @@
+node_modules
+.next
+logs
+dist
+.env
+.env.local
+.env.*.local
+database/*.db
+database/*.db-wal
+database/*.db-shm
+desktop/dist
+desktop/server
+desktop/node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

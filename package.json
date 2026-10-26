@@ -1,0 +1,121 @@
+{
+  "name": "@seip/next",
+  "version": "0.0.1",
+  "description": "Production-ready toolkit for Next.js and Nextron/Electron: SQLite/Postgres/MySQL singleton ORM, proxy.js auth, rate limiting, token-efficient AI, validation, migrations, and VPS/Desktop deployment tooling.",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./database": {
+      "types": "./core/database.d.ts",
+      "default": "./core/database.js"
+    },
+    "./config": {
+      "types": "./core/config.d.ts",
+      "default": "./core/config.js"
+    },
+    "./auth": {
+      "types": "./core/auth.d.ts",
+      "default": "./core/auth.js"
+    },
+    "./hash": {
+      "types": "./core/hash.d.ts",
+      "default": "./core/hash.js"
+    },
+    "./model": {
+      "types": "./core/model.d.ts",
+      "default": "./core/model.js"
+    },
+    "./ratelimit": {
+      "types": "./core/ratelimit.d.ts",
+      "default": "./core/ratelimit.js"
+    },
+    "./ia": {
+      "types": "./core/ia.d.ts",
+      "default": "./core/ia.js"
+    },
+    "./ai": {
+      "types": "./core/ia.d.ts",
+      "default": "./core/ia.js"
+    },
+    "./validate": {
+      "types": "./core/validate.d.ts",
+      "default": "./core/validate.js"
+    },
+    "./upload": {
+      "types": "./core/upload.d.ts",
+      "default": "./core/upload.js"
+    },
+    "./seo": {
+      "types": "./core/seo.d.ts",
+      "default": "./core/seo.js"
+    },
+    "./ws": {
+      "types": "./core/ws.d.ts",
+      "default": "./core/ws.js"
+    },
+    "./colors": {
+      "default": "./core/util/colors.js"
+    },
+    "./*": "./*"
+  },
+  "bin": {
+    "seip-next": "./bin/cli.js",
+    "seip": "./bin/cli.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/seip25/next.git"
+  },
+  "keywords": [
+    "nextjs",
+    "nextjs16",
+    "nextron",
+    "electron",
+    "sqlite",
+    "database",
+    "auth",
+    "proxy",
+    "ai",
+    "deepseek",
+    "ratelimit",
+    "orm",
+    "migrations",
+    "vps",
+    "pm2"
+  ],
+  "author": "Seip25",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "bin",
+    "core",
+    "index.js",
+    "index.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {},
+  "optionalDependencies": {
+    "better-sqlite3": "^11.8.1",
+    "bcrypt": "^5.1.1",
+    "multer": "^2.0.2",
+    "mysql2": "^3.12.0",
+    "pg": "^8.13.3",
+    "redis": "^6.1.0",
+    "ws": "^8.18.0",
+    "openai": "^4.86.1"
+  }
+}
