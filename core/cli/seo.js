@@ -29,9 +29,9 @@ export function makeSeo() {
   console.log("");
   console.log(colors.bold("Tip para Next.js App Router (sitemaps dinámicos):"));
   console.log(colors.gray("Puedes crear app/sitemap.js con:"));
-  console.log(colors.cyan("  import { Seo } from '@seip/next';\n  export default function sitemap() { return Seo.toNextSitemap(); }"));
+  console.log(colors.cyan("  import { Seo } from '@seip/nextjs';\n  export default function sitemap() { return Seo.toNextSitemap(); }"));
   console.log(colors.gray("Y app/robots.js con:"));
-  console.log(colors.cyan("  import { Seo } from '@seip/next';\n  export default function robots() { return Seo.toNextRobots(); }"));
+  console.log(colors.cyan("  import { Seo } from '@seip/nextjs';\n  export default function robots() { return Seo.toNextRobots(); }"));
   console.log("");
 }
 

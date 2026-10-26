@@ -29,7 +29,7 @@ export function detectModelsDir(customDir = null) {
 export function makeModel(name, customDir = null) {
   if (!name) {
     console.log(colors.red("[ERROR] Missing model name."));
-    console.log("Usage: npx @seip/next make:model <Name> [--dir <path>]");
+    console.log("Usage: npx @seip/nextjs make:model <Name> [--dir <path>]");
     process.exit(1);
   }
 
@@ -51,7 +51,7 @@ export function makeModel(name, customDir = null) {
     return;
   }
 
-  const template = `import { Model } from "@seip/next";
+  const template = `import { Model } from "@seip/nextjs";
 
 /**
  * ${cleanName} Model representation.

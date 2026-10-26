@@ -441,7 +441,7 @@ export async function showMigrationStatus() {
 export function makeSeed(name) {
   if (!name) {
     console.log(colors.red("[ERROR] Missing seed name."));
-    console.log("Usage: npx @seip/next make:seed <name>");
+    console.log("Usage: npx @seip/nextjs make:seed <name>");
     process.exit(1);
   }
 

@@ -1,4 +1,4 @@
-# @seip/next
+# @seip/nextjs
 
 > Production-ready toolkit for **Next.js (App Router, Server Actions, Route Handlers, proxy.js)** and **Nextron / Electron Desktop Apps**. Designed for self-hosted VPS deployments (PM2 + Nginx) and native desktop software.
 
@@ -29,7 +29,7 @@
 ## 📦 Instalación
 
 ```bash
-npm install @seip/next
+npm install @seip/nextjs
 ```
 
 *Opcionales según tu base de datos o necesidades:*
@@ -48,7 +48,7 @@ npm install ws             # Si usas el servidor WebSocket independiente
 
 ```javascript
 // src/models/user.js
-import { Model } from "@seip/next";
+import { Model } from "@seip/nextjs";
 
 export default class User extends Model {
   static table = "users";
@@ -87,7 +87,7 @@ export async function register(formData) {
 
 ```javascript
 // proxy.js (o middleware.js)
-import { Auth, RateLimit } from "@seip/next";
+import { Auth, RateLimit } from "@seip/nextjs";
 
 export async function proxy(request) {
   // 1. Rate Limit
@@ -110,7 +110,7 @@ export async function proxy(request) {
 
 ```javascript
 // app/api/chat/route.js
-import { IA } from "@seip/next";
+import { IA } from "@seip/nextjs";
 
 export async function POST(req) {
   const { message } = await req.json();
@@ -140,7 +140,7 @@ export async function POST(req) {
 
 ```javascript
 // app/api/upload/route.js
-import { Upload } from "@seip/next";
+import { Upload } from "@seip/nextjs";
 
 export async function POST(req) {
   const formData = await req.formData();
@@ -162,7 +162,7 @@ export async function POST(req) {
 
 ```javascript
 // app/sitemap.js
-import { Seo } from "@seip/next";
+import { Seo } from "@seip/nextjs";
 
 export default function sitemap() {
   Seo.registerRoute("/");
@@ -176,7 +176,7 @@ export default function sitemap() {
 
 ```javascript
 // app/robots.js
-import { Seo } from "@seip/next";
+import { Seo } from "@seip/nextjs";
 
 export default function robots() {
   return Seo.toNextRobots();
@@ -185,22 +185,22 @@ export default function robots() {
 
 ---
 
-## 💻 Comandos del CLI (`npx @seip/next`)
+## 💻 Comandos del CLI (`npx @seip/nextjs`)
 
 ```bash
 # Modelos y Migraciones
-npx @seip/next make:model User        # Crea modelo en src/models o app/models
-npx @seip/next make:migration         # Genera migración comparando modelos con la BD
-npx @seip/next migrate                # Ejecuta migraciones pendientes
-npx @seip/next migrate:status         # Muestra el historial de migraciones
-npx @seip/next migrate:rollback       # Revierte el último lote
+npx @seip/nextjs make:model User        # Crea modelo en src/models o app/models
+npx @seip/nextjs make:migration         # Genera migración comparando modelos con la BD
+npx @seip/nextjs migrate                # Ejecuta migraciones pendientes
+npx @seip/nextjs migrate:status         # Muestra el historial de migraciones
+npx @seip/nextjs migrate:rollback       # Revierte el último lote
 
 # Despliegue en VPS
-npx @seip/next make:ecosystem         # Genera ecosystem.config.cjs para PM2
-npx @seip/next nginx:conf midominio.com 3000 /var/www/proyecto # Configura Nginx y Certbot
+npx @seip/nextjs make:ecosystem         # Genera ecosystem.config.cjs para PM2
+npx @seip/nextjs nginx:conf midominio.com 3000 /var/www/proyecto # Configura Nginx y Certbot
 
 # Aplicación de Escritorio (Desktop)
-npx @seip/next make:desktop           # Genera scaffold de Nextron / Electron
+npx @seip/nextjs make:desktop           # Genera scaffold de Nextron / Electron
 ```
 
 ---

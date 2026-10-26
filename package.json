@@ -1,6 +1,6 @@
 {
-  "name": "@seip/next",
-  "version": "0.0.1",
+  "name": "@seip/nextjs",
+  "version": "0.0.2",
   "description": "Production-ready toolkit for Next.js and Nextron/Electron: SQLite/Postgres/MySQL singleton ORM, proxy.js auth, rate limiting, token-efficient AI, validation, migrations, and VPS/Desktop deployment tooling.",
   "type": "module",
   "main": "./index.js",
@@ -64,6 +64,7 @@
     "./*": "./*"
   },
   "bin": {
+    "seip-nextjs": "./bin/cli.js",
     "seip-next": "./bin/cli.js",
     "seip": "./bin/cli.js"
   },

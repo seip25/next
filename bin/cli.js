@@ -21,7 +21,7 @@ const command = args[0];
 
 function showHelp() {
   console.log(colors.bold.cyan("\n============================================================="));
-  console.log(colors.bold.cyan(" @seip/next CLI - Production Toolkit for Next.js & Desktop"));
+  console.log(colors.bold.cyan(" @seip/nextjs CLI - Production Toolkit for Next.js & Desktop"));
   console.log(colors.bold.cyan("=============================================================\n"));
 
   console.log(colors.bold("Comandos disponibles:\n"));
