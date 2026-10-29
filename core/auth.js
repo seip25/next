@@ -19,9 +19,54 @@ setInterval(() => {
   }
 }, 300000).unref();
 
+const MIN_SECRET_LENGTH = 32;
+let warnedMissingSecret = false;
+
+/**
+ * Resolves the signing/encryption secret.
+ * There is deliberately no fallback: signing tokens with a public default
+ * would allow anyone to forge sessions. Misconfiguration must fail loudly.
+ * @param {string} [secret] Explicit secret (takes precedence over JWT_SECRET).
+ * @returns {string}
+ * @throws {Error} When no secret is configured or it is too short in production.
+ */
+function resolveSecret(secret) {
+  const resolved = secret || process.env.JWT_SECRET;
+  if (typeof resolved !== "string" || resolved.trim().length === 0) {
+    throw new Error(
+      "[AUTH ERROR] JWT_SECRET is not configured. Set the JWT_SECRET environment variable " +
+        "(or pass the secret explicitly). Tokens are never signed with a public default."
+    );
+  }
+  if (process.env.NODE_ENV === "production" && resolved.trim().length < MIN_SECRET_LENGTH) {
+    throw new Error(
+      `[AUTH ERROR] JWT_SECRET must be at least ${MIN_SECRET_LENGTH} characters in production.`
+    );
+  }
+  return resolved;
+}
+
 function getAesKey(secret) {
-  const resolved = secret || process.env.JWT_SECRET || "default-seip-next-jwt-secret-min32chars";
-  return createHash("sha256").update(resolved).digest();
+  return createHash("sha256").update(resolveSecret(secret)).digest();
+}
+
+/**
+ * Reads the `exp` claim (seconds) from a signed token body without verifying it.
+ * Only used to size the in-memory revocation entry; verification happens first.
+ * @param {string} token
+ * @returns {number|null} Expiry in milliseconds.
+ */
+function tokenExpiryMs(token) {
+  try {
+    const body = JSON.parse(Buffer.from(token.split(".")[1] || "", "base64url").toString("utf8"));
+    return typeof body.exp === "number" ? body.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function parseDuration(duration) {
@@ -43,10 +88,10 @@ function parseDuration(duration) {
  */
 class Auth {
   static encrypt(payload, secret = process.env.JWT_SECRET) {
-    const resolvedSecret = secret || process.env.JWT_SECRET;
-    if (!resolvedSecret && process.env.NODE_ENV === "production") {
-      throw new Error("[AUTH FATAL] JWT_SECRET must be defined in production.");
+    if (payload === undefined) {
+      throw new Error("[AUTH ERROR] Cannot encrypt an undefined payload.");
     }
+    const resolvedSecret = resolveSecret(secret);
     const iv = randomBytes(12);
     const key = getAesKey(resolvedSecret);
     const cipher = createCipheriv("aes-256-gcm", key, iv);
@@ -57,9 +102,9 @@ class Auth {
   }
 
   static decrypt(data, secret = process.env.JWT_SECRET) {
-    const resolvedSecret = secret || process.env.JWT_SECRET;
-    if (!data || typeof data !== "string") return null;
+    if (!data || typeof data !== "string" || data.length > 16384) return null;
     try {
+      const resolvedSecret = resolveSecret(secret);
       const [ivHex, tagHex, encryptedHex] = data.split(":");
       if (!ivHex || !tagHex || !encryptedHex) return null;
 
@@ -78,7 +123,7 @@ class Auth {
   }
 
   static generateToken(payload, secret = process.env.JWT_SECRET, expiresIn = "7d") {
-    const resolvedSecret = secret || process.env.JWT_SECRET || "default-secret-min-32-chars-long";
+    const resolvedSecret = resolveSecret(secret);
     const encrypted = this.encrypt(payload, resolvedSecret);
     const now = Math.floor(Date.now() / 1000);
     const ttl = parseDuration(expiresIn);
@@ -94,8 +139,20 @@ class Auth {
   }
 
   static verifyToken(token, secret = process.env.JWT_SECRET) {
-    const resolvedSecret = secret || process.env.JWT_SECRET || "default-secret-min-32-chars-long";
-    if (!token || typeof token !== "string") return null;
+    if (!token || typeof token !== "string" || token.length > 8192) return null;
+
+    // Fail closed: without a secret there is no way to verify a token.
+    // Log once per process instead of crashing every request.
+    let resolvedSecret;
+    try {
+      resolvedSecret = resolveSecret(secret);
+    } catch (err) {
+      if (!warnedMissingSecret) {
+        warnedMissingSecret = true;
+        console.error(err.message);
+      }
+      return null;
+    }
 
     try {
       const parts = token.split(".");
@@ -112,7 +169,7 @@ class Auth {
 
       const decoded = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
       if (!decoded || !decoded.data) return null;
-      if (Math.floor(Date.now() / 1000) > decoded.exp) return null;
+      if (Math.floor(Date.now() / 1000) >= decoded.exp) return null;
 
       const payload = this.decrypt(decoded.data, resolvedSecret);
       if (payload && payload._sessionId && revokedSessions.has(payload._sessionId)) {
@@ -163,8 +220,14 @@ class Auth {
       token = request.cookies.get(cookieKey)?.value;
     } else if (typeof request.headers?.get === "function") {
       const cookieHeader = request.headers.get("cookie") || "";
-      const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${cookieKey}=([^;]+)`));
-      if (match) token = decodeURIComponent(match[1]);
+      const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${escapeRegExp(cookieKey)}=([^;]+)`));
+      if (match) {
+        try {
+          token = decodeURIComponent(match[1]);
+        } catch {
+          token = null; // Malformed percent-encoding must not crash the proxy.
+        }
+      }
       if (!token) {
         const authHeader = request.headers.get("authorization");
         if (authHeader && authHeader.startsWith("Bearer ")) {
@@ -227,8 +290,14 @@ class Auth {
         token = item?.value || (typeof item === "string" ? item : null);
       } else if (cookiesOrRequest.headers?.get) {
         const cookieHeader = cookiesOrRequest.headers.get("cookie") || "";
-        const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${cookieKey}=([^;]+)`));
-        if (match) token = decodeURIComponent(match[1]);
+        const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${escapeRegExp(cookieKey)}=([^;]+)`));
+        if (match) {
+          try {
+            token = decodeURIComponent(match[1]);
+          } catch {
+            token = null;
+          }
+        }
         if (!token) {
           const auth = cookiesOrRequest.headers.get("authorization");
           if (auth && auth.startsWith("Bearer ")) token = auth.slice(7).trim();
@@ -291,12 +360,43 @@ class Auth {
   }
 
   /**
+   * Revokes a signed token server-side (in-memory) until it expires.
+   * A revoked `_sessionId` makes `verifyToken` return null even if the cookie
+   * is still presented (e.g. stolen token after logout).
+   * @param {string} token
+   * @returns {boolean} true when the session was revoked.
+   */
+  static revoke(token) {
+    const payload = this.verifyToken(token);
+    if (!payload || !payload._sessionId) return false;
+    const expMs = tokenExpiryMs(token) || Date.now() + 7 * 24 * 3600 * 1000;
+    revokedSessions.set(payload._sessionId, expMs);
+    return true;
+  }
+
+  /**
    * Logs out user and revokes session.
    * @param {Object} [options={}]
    * @returns {Promise<boolean>}
    */
   static async logout(options = {}) {
     const { cookieKey = "auth", cookieStore = null } = options;
+
+    // Best effort: revoke the session server-side before deleting the cookie.
+    try {
+      let token = null;
+      if (cookieStore && typeof cookieStore.get === "function") {
+        const item = await cookieStore.get(cookieKey);
+        token = item?.value || (typeof item === "string" ? item : null);
+      } else {
+        const { cookies } = await import("next/headers");
+        const store = await cookies();
+        token = store.get(cookieKey)?.value;
+      }
+      if (token) this.revoke(token);
+    } catch {
+      // Cookie store unavailable: still clear the cookie below.
+    }
 
     const cookieOptions = {
       name: cookieKey,

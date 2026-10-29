@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import {
   Config,
   Hash,
@@ -238,4 +240,254 @@ test("Database & Model: in-memory SQLite, DDL, and CRUD", async () => {
   assert.equal(exists, true);
 
   await db.close();
+});
+
+test("Security: Auth refuses to sign without JWT_SECRET", () => {
+  const original = process.env.JWT_SECRET;
+  const originalError = console.error;
+  delete process.env.JWT_SECRET;
+  console.error = () => {};
+  try {
+    assert.throws(() => Auth.generateToken({ id: 1 }), /JWT_SECRET is not configured/);
+    assert.throws(() => Auth.encrypt({ id: 1 }), /JWT_SECRET is not configured/);
+    assert.equal(Auth.verifyToken("a.b.c"), null);
+  } finally {
+    console.error = originalError;
+    if (original === undefined) delete process.env.JWT_SECRET;
+    else process.env.JWT_SECRET = original;
+  }
+});
+
+test("Security: uploads reject path traversal and dangerous extensions", async () => {
+  assert.throws(() => Upload.getDestination("../evil"), /Invalid upload folder/);
+  assert.throws(() => Upload.getDestination("/etc"), /Invalid upload folder/);
+  assert.throws(() => Upload.getDestination("a/../../b"), /Invalid upload folder/);
+
+  const fakeHtml = {
+    name: "evil.html",
+    type: "text/html",
+    size: 4,
+    arrayBuffer: async () => new ArrayBuffer(4),
+  };
+  await assert.rejects(
+    Upload.save(fakeHtml, { folder: "test-uploads" }),
+    /not allowed for security reasons/
+  );
+
+  const tmpDir = path.join(process.cwd(), "tmp-upload-test");
+  Config.setUserDataDir(tmpDir);
+  try {
+    const fakePng = {
+      name: "photo.html",
+      type: "image/png",
+      size: 4,
+      arrayBuffer: async () => new ArrayBuffer(4),
+    };
+    const saved = await Upload.save(fakePng, { folder: "test-uploads" });
+    assert.ok(saved.filename.endsWith(".png"), "extension must come from the MIME type");
+    assert.equal(saved.url, `/test-uploads/${saved.filename}`);
+    assert.ok(fs.existsSync(saved.path));
+    assert.throws(() => Upload.url("../x", "test-uploads"), /Invalid filename/);
+  } finally {
+    Config.setUserDataDir(null);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(path.join(process.cwd(), "public", "test-uploads"), {
+      recursive: true,
+      force: true,
+    });
+  }
+});
+
+test("Security: validator rejects dangerous URL schemes", async () => {
+  const validator = new Validator({ u: { url: true } });
+  for (const bad of [
+    "javascript:alert(1)",
+    "data:text/html,x",
+    "vbscript:msgbox(1)",
+    "file:///etc/passwd",
+  ]) {
+    const result = await validator.validate({ u: bad });
+    assert.equal(result.success, false, `${bad} must be rejected`);
+  }
+  const ok = await validator.validate({ u: "https://example.com/a?b=1" });
+  assert.equal(ok.success, true);
+});
+
+test("Model: refuses unsafe conditions instead of dropping them", async () => {
+  const db = new Database(1, 0, { DB_TYPE: "sqlite", DB_FILE: ":memory:" });
+  await db.init();
+
+  class Doc extends Model {
+    static table = "docs";
+    static schema = {
+      id: { type: "int", primary: true, auto: true },
+      title: { type: "string" },
+    };
+  }
+  Doc.setDatabase(db);
+
+  try {
+    await db.query(Doc.toDDL("sqlite"));
+
+    await assert.rejects(Doc.update({}, { title: "x" }), /without WHERE conditions/);
+    await assert.rejects(Doc.delete({}), /without WHERE conditions/);
+    await assert.rejects(Doc.all({ where: { title: {} } }), /Empty condition object/);
+    await assert.rejects(Doc.all({ where: { title: { $gtt: "x" } } }), /Unsupported condition operator/);
+    await assert.rejects(Doc.all({ where: { title: { $in: "x" } } }), /requires an array/);
+
+    const id = await Doc.create({ title: "Hola" });
+    assert.ok(id);
+
+    // A Date condition must filter (params normalized to ISO), not be dropped.
+    const byDate = await Doc.all({ where: { title: new Date() } });
+    assert.equal(byDate.length, 0);
+
+    const found = await Doc.find({ title: "Hola" });
+    assert.equal(found.title, "Hola");
+  } finally {
+    Doc.setDatabase(null);
+    await db.close();
+  }
+});
+
+test("Database: INSERT with literal 'returning' returns the real id", async () => {
+  const db = new Database(1, 0, { DB_TYPE: "sqlite", DB_FILE: ":memory:" });
+  await db.init();
+  try {
+    await db.query("CREATE TABLE logs (id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT)");
+
+    const id = await db.query("INSERT INTO logs (msg) VALUES ('returning home')");
+    assert.equal(typeof id, "number");
+    assert.ok(id > 0);
+
+    const rows = await db.query("SELECT COUNT(*) as c FROM logs", [], { return_row: true });
+    assert.equal(rows.c, 1);
+
+    const id2 = await db.query("INSERT INTO logs (msg) VALUES ('plain')");
+    assert.equal(id2, id + 1);
+  } finally {
+    await db.close();
+  }
+});
+
+test("Database: DB_TYPE aliases normalized and programmatic config wins", async () => {
+  const db = new Database(1, 0, {
+    DB_TYPE: "pg",
+    host: "10.0.0.1",
+    user: "app",
+    password: "secret",
+    database: "db1",
+    port: 6543,
+  });
+  try {
+    assert.equal(db.type, "postgres");
+    assert.equal(db.config.host, "10.0.0.1");
+    assert.equal(db.config.user, "app");
+    assert.equal(db.config.password, "secret");
+    assert.equal(db.config.database, "db1");
+    assert.equal(db.config.port, 6543);
+  } finally {
+    await db.close();
+  }
+});
+
+test("Auth: logout revokes the session server-side", async () => {
+  const previous = process.env.JWT_SECRET;
+  process.env.JWT_SECRET = "x".repeat(40);
+  try {
+    let stored = null;
+    const cookieStore = {
+      set: async (options) => {
+        stored = options;
+      },
+      get: async () => stored,
+    };
+
+    const { token } = await Auth.login({ id: 7, role: "user" }, { cookieStore });
+    assert.ok(Auth.verifyToken(token));
+
+    await Auth.logout({ cookieStore });
+    assert.equal(Auth.verifyToken(token), null);
+  } finally {
+    if (previous === undefined) delete process.env.JWT_SECRET;
+    else process.env.JWT_SECRET = previous;
+  }
+});
+
+test("Auth: malformed cookie does not crash handleProxy", async () => {
+  const previous = process.env.JWT_SECRET;
+  process.env.JWT_SECRET = "y".repeat(40);
+  try {
+    const response = await Auth.handleProxy(
+      {
+        url: "http://localhost:3000/dashboard",
+        pathname: "/dashboard",
+        headers: { get: (header) => (header === "cookie" ? "auth=%zz" : null) },
+      },
+      { protectedRoutes: ["/dashboard"] }
+    );
+    assert.ok(response);
+    assert.equal(response.status, 307);
+  } finally {
+    if (previous === undefined) delete process.env.JWT_SECRET;
+    else process.env.JWT_SECRET = previous;
+  }
+});
+
+test("Database: nested transactions use savepoints", async () => {
+  const db = new Database(1, 0, { DB_TYPE: "sqlite", DB_FILE: ":memory:" });
+  await db.init();
+  try {
+    await db.query("CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)");
+
+    await db.transaction(async (tx) => {
+      await tx.query("INSERT INTO items (name) VALUES (?)", ["outer"]);
+      await db.transaction(async (tx2) => {
+        await tx2.query("INSERT INTO items (name) VALUES (?)", ["inner"]);
+      });
+    });
+
+    let rows = await db.query("SELECT name FROM items ORDER BY id");
+    assert.deepEqual(rows.map((r) => r.name), ["outer", "inner"]);
+
+    // An inner failure must roll back only the inner work.
+    await db.transaction(async (tx) => {
+      await tx.query("INSERT INTO items (name) VALUES (?)", ["outer2"]);
+      await db
+        .transaction(async () => {
+          throw new Error("boom");
+        })
+        .catch(() => {});
+    });
+
+    rows = await db.query("SELECT name FROM items ORDER BY id");
+    assert.deepEqual(rows.map((r) => r.name), ["outer", "inner", "outer2"]);
+  } finally {
+    await db.close();
+  }
+});
+
+test("Database: concurrent SQLite transactions are serialized", async () => {
+  const db = new Database(1, 0, { DB_TYPE: "sqlite", DB_FILE: ":memory:" });
+  await db.init();
+  try {
+    await db.query("CREATE TABLE counter (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)");
+
+    const results = await Promise.all([
+      db.transaction(async (tx) => {
+        await tx.query("INSERT INTO counter (v) VALUES (?)", ["a"]);
+        return "a";
+      }),
+      db.transaction(async (tx) => {
+        await tx.query("INSERT INTO counter (v) VALUES (?)", ["b"]);
+        return "b";
+      }),
+    ]);
+    assert.deepEqual(results, ["a", "b"]);
+
+    const rows = await db.query("SELECT COUNT(*) as n FROM counter", [], { return_row: true });
+    assert.equal(rows.n, 2);
+  } finally {
+    await db.close();
+  }
 });

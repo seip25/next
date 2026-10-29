@@ -1,43 +1,33 @@
 import fs from "node:fs";
 import path from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
 import Config from "./config.js";
 
-const rawDbType = (process.env.DB_TYPE || "").toLowerCase().trim();
-let DB_TYPE = "";
-
-if (
-  rawDbType === "sqlite" ||
-  rawDbType === "sqlite3" ||
-  rawDbType === "sql" ||
-  rawDbType === "better-sqlite3" ||
-  rawDbType === "better-sqlite" ||
-  rawDbType === "lite"
-) {
-  DB_TYPE = "sqlite";
-} else if (
-  rawDbType === "postgres" ||
-  rawDbType === "postgresql" ||
-  rawDbType === "pg" ||
-  rawDbType === "psql" ||
-  rawDbType === "pgsql"
-) {
-  DB_TYPE = "postgres";
-} else if (
-  rawDbType === "mysql" ||
-  rawDbType === "mariadb" ||
-  rawDbType === "maria" ||
-  rawDbType === "my"
-) {
-  DB_TYPE = "mysql";
-} else if (
-  rawDbType === "none" ||
-  rawDbType === "no" ||
-  rawDbType === "false" ||
-  rawDbType === "null" ||
-  rawDbType === "0"
-) {
-  DB_TYPE = "none";
+/**
+ * Normalizes any supported DB_TYPE alias ("pg", "mariadb", "better-sqlite"…)
+ * to one of: "sqlite", "postgres", "mysql", "none" or "" (unknown).
+ * @param {string} [value]
+ * @returns {string}
+ */
+function normalizeDbType(value) {
+  const raw = String(value ?? "").toLowerCase().trim();
+  if (!raw) return "";
+  if (["sqlite", "sqlite3", "sql", "better-sqlite3", "better-sqlite", "lite"].includes(raw)) {
+    return "sqlite";
+  }
+  if (["postgres", "postgresql", "pg", "psql", "pgsql"].includes(raw)) {
+    return "postgres";
+  }
+  if (["mysql", "mariadb", "maria", "my"].includes(raw)) {
+    return "mysql";
+  }
+  if (["none", "no", "false", "null", "0"].includes(raw)) {
+    return "none";
+  }
+  return "";
 }
+
+let DB_TYPE = normalizeDbType(process.env.DB_TYPE);
 
 if (!DB_TYPE && process.env.DATABASE_URL && !process.env.DATABASE_URL.startsWith("#")) {
   if (
@@ -57,6 +47,10 @@ if (!DB_TYPE && process.env.DATABASE_URL && !process.env.DATABASE_URL.startsWith
 if (!DB_TYPE) {
   DB_TYPE = "sqlite";
 }
+
+/** Tracks transaction nesting per async context (avoids cross-request false nesting). */
+const txContext = new AsyncLocalStorage();
+
 
 let mysqlPromise = null;
 let pgPromise = null;
@@ -138,6 +132,72 @@ function toPostgresSql(sql) {
   return result;
 }
 
+/**
+ * Detects a real RETURNING clause, ignoring the word inside string literals,
+ * quoted identifiers and SQL comments. A naive substring test makes an
+ * INSERT like "VALUES ('returning home')" take the SELECT branch and return
+ * the wrong result ([] instead of lastInsertRowid).
+ * @param {string} sql
+ * @returns {boolean}
+ */
+function hasReturningClause(sql) {
+  let inSingle = false;
+  let inDouble = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+
+  for (let i = 0; i < sql.length; i++) {
+    const char = sql[i];
+    const next = sql[i + 1];
+
+    if (inLineComment) {
+      if (char === "\n") inLineComment = false;
+      continue;
+    }
+    if (inBlockComment) {
+      if (char === "*" && next === "/") {
+        inBlockComment = false;
+        i++;
+      }
+      continue;
+    }
+    if (!inSingle && !inDouble && char === "-" && next === "-") {
+      inLineComment = true;
+      i++;
+      continue;
+    }
+    if (!inSingle && !inDouble && char === "/" && next === "*") {
+      inBlockComment = true;
+      i++;
+      continue;
+    }
+    if (char === "'" && !inDouble) {
+      if (inSingle && next === "'") {
+        i++;
+        continue;
+      }
+      inSingle = !inSingle;
+      continue;
+    }
+    if (char === '"' && !inSingle) {
+      if (inDouble && next === '"') {
+        i++;
+        continue;
+      }
+      inDouble = !inDouble;
+      continue;
+    }
+    if (!inSingle && !inDouble && (char === "R" || char === "r")) {
+      const isBoundaryBefore = !/[A-Za-z0-9_]/.test(sql[i - 1] || "");
+      const isBoundaryAfter = !/[A-Za-z0-9_]/.test(sql[i + 9] || "");
+      if (isBoundaryBefore && isBoundaryAfter && sql.slice(i, i + 9).toUpperCase() === "RETURNING") {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 const _activeDatabases = new Set();
 
 /**
@@ -148,9 +208,11 @@ class Database {
   constructor(connectionLimit = 10, queueLimit = 0, config = {}) {
     this.pool = null;
     this.db = null;
-    this.type = config.DB_TYPE || DB_TYPE;
+    this.type = normalizeDbType(config.DB_TYPE) || DB_TYPE;
     this._stmtCache = new Map();
     this._maxStatements = 500;
+    this._txQueue = Promise.resolve();
+    this._savepointCounter = 0;
 
     let defaultSqliteFile = process.env.DB_FILE || "database/app.db";
     let busyTimeout = 5000;
@@ -196,12 +258,13 @@ class Database {
 
     this.config = {
       ...config,
-      host: process.env.DB_HOST || "localhost",
-      user: process.env.DB_USER || (this.type === "postgres" ? "postgres" : "root"),
-      password: process.env.DB_PASSWORD || "root",
-      database: process.env.DB_NAME || "app",
-      port: parseInt(process.env.DB_PORT, 10) || (this.type === "postgres" ? 5432 : 3306),
-      charset: "utf8mb4",
+      // Explicit constructor config wins over environment variables.
+      host: config.host ?? process.env.DB_HOST ?? "localhost",
+      user: config.user ?? process.env.DB_USER ?? (this.type === "postgres" ? "postgres" : "root"),
+      password: config.password ?? process.env.DB_PASSWORD ?? "root",
+      database: config.database ?? process.env.DB_NAME ?? "app",
+      port: config.port ?? (parseInt(process.env.DB_PORT, 10) || (this.type === "postgres" ? 5432 : 3306)),
+      charset: config.charset ?? "utf8mb4",
       waitForConnections: true,
       connectionLimit: connectionLimit,
       queueLimit: queueLimit,
@@ -324,13 +387,21 @@ class Database {
       }
     }
 
+    // No driver available for this dialect: fail instead of pretending to succeed.
+    const canInitPostgres = this.type === "postgres" && Boolean(pgPromise);
+    const canInitMysql = this.type === "mysql" && Boolean(mysqlPromise);
+    if (!canInitPostgres && !canInitMysql) {
+      console.error(`[DATABASE ERROR] No driver available for database type '${this.type}'.`);
+      return false;
+    }
+
     for (let attempt = 1; attempt <= retries; attempt++) {
       try {
-        if (this.type === "postgres" && pgPromise) {
+        if (canInitPostgres) {
           const pg = pgPromise.default || pgPromise;
           this.pool = new pg.Pool(this.config);
           await this.pool.query("SELECT 1");
-        } else if (mysqlPromise) {
+        } else {
           const { max, connectionString, ...mysqlConfig } = this.config;
           this.pool = mysqlPromise.createPool(mysqlConfig);
           await this.pool.query("SELECT 1");
@@ -365,7 +436,7 @@ class Database {
     const queryOptions = typeof options === "string" ? { [options]: true } : options;
     const cleanSql = sql.trim();
     const isSelect = /^\s*(select|pragma|explain|with)\b/i.test(cleanSql);
-    const hasReturning = /\breturning\b/i.test(cleanSql);
+    const hasReturning = hasReturningClause(cleanSql);
     const isInsert = /^\s*insert\b/i.test(cleanSql);
 
     try {
@@ -405,7 +476,7 @@ class Database {
         }
 
         return res.rowCount;
-      } else {
+      } else if (this.type === "mysql" && this.pool) {
         const [results] = await this.pool.execute(cleanSql, params);
 
         if (isSelect || hasReturning) {
@@ -414,10 +485,15 @@ class Database {
         }
 
         if (isInsert) {
-          return results.insertId || results;
+          if (results && results.insertId !== undefined && results.insertId !== null) {
+            return results.insertId;
+          }
+          return results;
         }
 
         return results;
+      } else {
+        throw new Error(`[DATABASE ERROR] No connection available for database type '${this.type}'.`);
       }
     } catch (err) {
       if (!queryOptions.silent) {
@@ -471,41 +547,7 @@ class Database {
     }
 
     if (this.type === "sqlite" && this.db) {
-      this.db.exec("BEGIN IMMEDIATE");
-      try {
-        const tx = {
-          query: async (sql, params = [], options = {}) => {
-            const queryOptions = typeof options === "string" ? { [options]: true } : options;
-            const cleanSql = sql.trim();
-            const isSelect = /^\s*(select|pragma|explain|with)\b/i.test(cleanSql);
-            const hasReturning = /\breturning\b/i.test(cleanSql);
-            const isInsert = /^\s*insert\b/i.test(cleanSql);
-
-            const stmt = this._getPreparedStatement(cleanSql);
-            if (isSelect || hasReturning) {
-              if (queryOptions.return_row) {
-                const row = stmt.get(...params);
-                return row || null;
-              }
-              return stmt.all(...params);
-            }
-            if (isInsert) {
-              const info = stmt.run(...params);
-              return Number(info.lastInsertRowid);
-            }
-            const info = stmt.run(...params);
-            return info.changes;
-          },
-        };
-
-        const result = await callback(tx);
-        this.db.exec("COMMIT");
-        return result;
-      } catch (err) {
-        this.db.exec("ROLLBACK");
-        console.error("[DATABASE ERROR] Transaction rolled back:", err.message);
-        throw err;
-      }
+      return this._sqliteTransaction(callback);
     } else if (this.type === "postgres" && pgPromise) {
       const client = await this.pool.connect();
       try {
@@ -515,7 +557,7 @@ class Database {
             const queryOptions = typeof options === "string" ? { [options]: true } : options;
             const cleanSql = sql.trim();
             const isSelect = /^\s*(select|pragma|explain|with)\b/i.test(cleanSql);
-            const hasReturning = /\breturning\b/i.test(cleanSql);
+            const hasReturning = hasReturningClause(cleanSql);
             const isInsert = /^\s*insert\b/i.test(cleanSql);
 
             const pgSql = toPostgresSql(cleanSql);
@@ -543,7 +585,7 @@ class Database {
       } finally {
         client.release();
       }
-    } else {
+    } else if (this.type === "mysql" && this.pool) {
       const connection = await this.pool.getConnection();
       try {
         await connection.beginTransaction();
@@ -552,7 +594,7 @@ class Database {
             const queryOptions = typeof options === "string" ? { [options]: true } : options;
             const cleanSql = sql.trim();
             const isSelect = /^\s*(select|pragma|explain|with)\b/i.test(cleanSql);
-            const hasReturning = /\breturning\b/i.test(cleanSql);
+            const hasReturning = hasReturningClause(cleanSql);
             const isInsert = /^\s*insert\b/i.test(cleanSql);
 
             const [results] = await connection.execute(cleanSql, params);
@@ -561,7 +603,10 @@ class Database {
               return queryOptions.return_row ? (rows[0] || null) : rows;
             }
             if (isInsert) {
-              return results.insertId || results;
+              if (results && results.insertId !== undefined && results.insertId !== null) {
+                return results.insertId;
+              }
+              return results;
             }
             return results;
           },
@@ -577,6 +622,89 @@ class Database {
       } finally {
         connection.release();
       }
+    } else {
+      throw new Error(`[DATABASE ERROR] No connection available for database type '${this.type}'.`);
+    }
+  }
+
+  /**
+   * Query adapter bound to the current SQLite transaction.
+   * @returns {(sql: string, params?: any[], options?: Object|string) => Promise<any>}
+   */
+  _sqliteTxQuery() {
+    return async (sql, params = [], options = {}) => {
+      const queryOptions = typeof options === "string" ? { [options]: true } : options;
+      const cleanSql = sql.trim();
+      const isSelect = /^\s*(select|pragma|explain|with)\b/i.test(cleanSql);
+      const hasReturning = hasReturningClause(cleanSql);
+      const isInsert = /^\s*insert\b/i.test(cleanSql);
+
+      const stmt = this._getPreparedStatement(cleanSql);
+      if (isSelect || hasReturning) {
+        if (queryOptions.return_row) {
+          const row = stmt.get(...params);
+          return row || null;
+        }
+        return stmt.all(...params);
+      }
+      if (isInsert) {
+        const info = stmt.run(...params);
+        return Number(info.lastInsertRowid);
+      }
+      const info = stmt.run(...params);
+      return info.changes;
+    };
+  }
+
+  /**
+   * Runs a SQLite transaction. Top-level transactions are serialized through a
+   * queue (one connection), while nested calls become SAVEPOINTs so they can be
+   * rolled back independently without destroying the outer transaction.
+   * @param {Function} callback
+   * @returns {Promise<any>}
+   */
+  async _sqliteTransaction(callback) {
+    if (txContext.getStore()) {
+      return this._sqliteNestedTransaction(callback);
+    }
+
+    const run = () => txContext.run({}, () => this._sqliteRootTransaction(callback));
+    const queued = this._txQueue.then(run, run);
+    this._txQueue = queued.then(
+      () => undefined,
+      () => undefined
+    );
+    return queued;
+  }
+
+  async _sqliteRootTransaction(callback) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = await callback({ query: this._sqliteTxQuery() });
+      this.db.exec("COMMIT");
+      return result;
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      console.error("[DATABASE ERROR] Transaction rolled back:", err.message);
+      throw err;
+    }
+  }
+
+  async _sqliteNestedTransaction(callback) {
+    const savepoint = `seip_sp_${++this._savepointCounter}`;
+    this.db.exec(`SAVEPOINT ${savepoint}`);
+    try {
+      const result = await callback({ query: this._sqliteTxQuery() });
+      this.db.exec(`RELEASE ${savepoint}`);
+      return result;
+    } catch (err) {
+      try {
+        this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        this.db.exec(`RELEASE ${savepoint}`);
+      } catch {}
+      throw err;
     }
   }
 

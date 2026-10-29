@@ -106,9 +106,11 @@ const validators = {
     value === true || value === false || value === "true" || value === "false",
   isISO8601: (value) => !isNaN(Date.parse(value)),
   isURL: (value) => {
+    if (typeof value !== "string" || value.length > 2048) return false;
     try {
-      new URL(value);
-      return true;
+      const url = new URL(value);
+      // Only absolute web URLs: blocks javascript:, data:, vbscript:, file:, etc.
+      return url.protocol === "http:" || url.protocol === "https:";
     } catch {
       return false;
     }

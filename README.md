@@ -85,6 +85,10 @@ export async function register(formData) {
 
 ### 2. Autenticación en `proxy.js` (Next.js 16)
 
+> **Requisito:** define `JWT_SECRET` (mínimo 32 caracteres en producción). No existe
+> secreto por defecto: sin `JWT_SECRET`, `Auth` lanza un error al firmar y rechaza
+> (devuelve `null`) al verificar. Es intencional para evitar tokens forjables.
+
 ```javascript
 // proxy.js (o middleware.js)
 import { Auth, RateLimit } from "@seip/nextjs";
@@ -137,6 +141,11 @@ export async function POST(req) {
 ---
 
 ### 4. Subida de Archivos Nativa
+
+> **Seguridad:** el destino se valida contra path traversal (carpetas solo con
+> `a-z0-9_-`), el nombre guardado es un UUID y la extensión se deriva del MIME type.
+> Extensiones ejecutables (`.html`, `.svg`, `.js`, `.php`, …) se rechazan por defecto;
+> solo se permiten con `allowDangerousExtensions: true` bajo tu responsabilidad.
 
 ```javascript
 // app/api/upload/route.js

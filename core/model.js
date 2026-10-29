@@ -18,7 +18,22 @@ async function tryRevalidateTag(tag) {
 }
 
 /**
+ * Normalizes values before binding them as SQL parameters.
+ * Dates are stored as ISO-8601 strings (same format used by timestamps),
+ * because SQLite drivers cannot bind Date objects.
+ * @param {any} value
+ * @returns {any}
+ */
+function normalizeBind(value) {
+  if (value instanceof Date) return value.toISOString();
+  if (value === undefined) return null;
+  return value;
+}
+
+/**
  * Builds parameterized WHERE clauses from a condition object, validating column identifiers.
+ * Throws instead of silently dropping conditions: a dropped condition turns a filtered
+ * query into a full-table one (and a filtered DELETE into a mass delete).
  * @param {Object} where
  * @returns {{whereClauses: string[], params: any[], whereSql: string}}
  */
@@ -34,9 +49,13 @@ function buildWhere(where) {
     $like: "LIKE",
   };
 
-  for (const [col, val] of Object.entries(where)) {
+  for (const [col, val] of Object.entries(where || {})) {
     if (!/^[a-zA-Z0-9_]+$/.test(col)) {
       throw new Error(`[MODEL ERROR] Invalid column identifier '${col}'`);
+    }
+
+    if (val === undefined) {
+      throw new Error(`[MODEL ERROR] Condition value for '${col}' is undefined.`);
     }
 
     if (Array.isArray(val)) {
@@ -44,41 +63,55 @@ function buildWhere(where) {
         whereClauses.push("1 = 0");
       } else {
         whereClauses.push(`${col} IN (${val.map(() => "?").join(", ")})`);
-        params.push(...val);
+        params.push(...val.map(normalizeBind));
       }
     } else if (val === null) {
       whereClauses.push(`${col} IS NULL`);
-    } else if (typeof val === "object" && val !== null) {
+    } else if (val instanceof Date) {
+      whereClauses.push(`${col} = ?`);
+      params.push(normalizeBind(val));
+    } else if (typeof val === "object") {
+      let added = false;
+
       for (const [op, opVal] of Object.entries(val)) {
-        if (op === "$in") {
-          if (Array.isArray(opVal) && opVal.length > 0) {
-            whereClauses.push(`${col} IN (${opVal.map(() => "?").join(", ")})`);
-            params.push(...opVal);
-          } else {
-            whereClauses.push("1 = 0");
+        if (op === "$in" || op === "$nin") {
+          if (!Array.isArray(opVal)) {
+            throw new Error(`[MODEL ERROR] Operator ${op} for '${col}' requires an array.`);
           }
-        } else if (op === "$nin") {
-          if (Array.isArray(opVal) && opVal.length > 0) {
-            whereClauses.push(`${col} NOT IN (${opVal.map(() => "?").join(", ")})`);
-            params.push(...opVal);
+          if (opVal.length > 0) {
+            whereClauses.push(`${col} ${op === "$in" ? "IN" : "NOT IN"} (${opVal.map(() => "?").join(", ")})`);
+            params.push(...opVal.map(normalizeBind));
           } else {
-            whereClauses.push("1 = 1");
+            whereClauses.push(op === "$in" ? "1 = 0" : "1 = 1");
           }
-        } else if (op === "$notNull" && opVal) {
+          added = true;
+        } else if (op === "$notNull" || op === "$null") {
+          if (opVal !== true) {
+            throw new Error(`[MODEL ERROR] Operator ${op} for '${col}' must be true (omit it otherwise).`);
+          }
+          whereClauses.push(op === "$null" ? `${col} IS NULL` : `${col} IS NOT NULL`);
+          added = true;
+        } else if (op === "$ne" && opVal === null) {
           whereClauses.push(`${col} IS NOT NULL`);
-        } else if (op === "$null" && opVal) {
-          whereClauses.push(`${col} IS NULL`);
+          added = true;
         } else if (opMap[op]) {
           whereClauses.push(`${col} ${opMap[op]} ?`);
-          params.push(opVal);
+          params.push(normalizeBind(opVal));
+          added = true;
         } else {
-          whereClauses.push(`${col} = ?`);
-          params.push(opVal);
+          throw new Error(`[MODEL ERROR] Unsupported condition operator '${op}' for column '${col}'.`);
         }
+      }
+
+      if (!added) {
+        throw new Error(
+          `[MODEL ERROR] Empty condition object for column '${col}'. ` +
+            "Use explicit operators ($gt, $in, $like, ...) or a plain value."
+        );
       }
     } else {
       whereClauses.push(`${col} = ?`);
-      params.push(val);
+      params.push(normalizeBind(val));
     }
   }
 
@@ -395,6 +428,9 @@ class Model {
     if (sets.length === 0) return 0;
 
     const { whereClauses, params: whereParams } = buildWhere(where);
+    if (whereClauses.length === 0) {
+      throw new Error("[MODEL ERROR] Refusing to run UPDATE without WHERE conditions.");
+    }
     params.push(...whereParams);
 
     const sql = `UPDATE ${this.table} SET ${sets.join(", ")} WHERE ${whereClauses.join(" AND ")}`;
@@ -408,6 +444,10 @@ class Model {
     const where = typeof idOrConditions === "object" && idOrConditions !== null
       ? { ...idOrConditions }
       : { [this.primaryKey]: idOrConditions };
+
+    if (Object.keys(where).length === 0) {
+      throw new Error("[MODEL ERROR] Refusing to run DELETE without WHERE conditions.");
+    }
 
     if (options.cascade && options.cascade.length > 0) {
       const records = await this.all({ where, withDeleted: true });
@@ -446,6 +486,9 @@ class Model {
       : { [this.primaryKey]: idOrConditions };
 
     const { whereClauses, params } = buildWhere(where);
+    if (whereClauses.length === 0) {
+      throw new Error("[MODEL ERROR] Refusing to run RESTORE without WHERE conditions.");
+    }
     const sql = `UPDATE ${this.table} SET deleted_at = NULL WHERE ${whereClauses.join(" AND ")}`;
     const changes = await this.getDatabase().query(sql, params);
 

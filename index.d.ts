@@ -199,6 +199,7 @@ export class Upload {
       folder?: string;
       maxSize?: number;
       allowedTypes?: string[];
+      allowDangerousExtensions?: boolean;
     }
   ): Promise<{
     filename: string;
@@ -207,8 +208,14 @@ export class Upload {
     size: number;
     mimeType: string;
   }>;
-  static storage(folder?: string): any;
-  static disk(options?: any): any;
+  static storage(folder?: string, options?: { allowDangerousExtensions?: boolean }): any;
+  static disk(options?: {
+    folder?: string;
+    maxSize?: number;
+    fileSize?: number;
+    allowedTypes?: string[];
+    allowDangerousExtensions?: boolean;
+  }): any;
   static url(filename: string, folder?: string): string;
 }
 
