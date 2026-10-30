@@ -201,16 +201,30 @@ export default function robots() {
 npx @seip/nextjs make:model User        # Crea modelo en src/models o app/models
 npx @seip/nextjs make:migration         # Genera migración comparando modelos con la BD
 npx @seip/nextjs migrate                # Ejecuta migraciones pendientes
-npx @seip/nextjs migrate:status         # Muestra el historial de migraciones
-npx @seip/nextjs migrate:rollback       # Revierte el último lote
+npx @seip/nextjs migrate:status         # Muestra el historial de migraciones (incluye huérfanas)
+npx @seip/nextjs migrate:rollback       # Revierte el último lote (exige sección Down)
+
+# Seeds (con tracking: no se re-ejecutan por accidente)
+npx @seip/nextjs make:seed users        # Crea database/seeds/users.sql
+npx @seip/nextjs seed                   # Ejecuta solo seeds pendientes
+npx @seip/nextjs seed --force           # Re-ejecuta todos los seeds
+
+# SEO y WebSocket
+npx @seip/nextjs make:seo               # Genera public/sitemap.xml y robots.txt
+npx @seip/nextjs ws:start --port 3001   # Servidor WebSocket independiente
 
 # Despliegue en VPS
 npx @seip/nextjs make:ecosystem         # Genera ecosystem.config.cjs para PM2
+npx @seip/nextjs make:ecosystem --start # Genera y arranca con PM2 (exit code != 0 si falla)
 npx @seip/nextjs nginx:conf midominio.com 3000 /var/www/proyecto # Configura Nginx y Certbot
 
 # Aplicación de Escritorio (Desktop)
 npx @seip/nextjs make:desktop           # Genera scaffold de Nextron / Electron
 ```
+
+**Migraciones JS:** además de `.sql`, el runner ejecuta `.js`/`.mjs` que exporten
+`async up(tx)` (y opcionalmente `down(tx)`), ejecutadas dentro de la misma transacción
+y registradas en `_seip_migrations` como cualquier otra migración.
 
 ---
 

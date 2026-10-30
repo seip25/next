@@ -17,7 +17,9 @@ import { makeSeo } from "../core/cli/seo.js";
 import { WebSocketManager } from "../core/ws.js";
 
 const args = process.argv.slice(2);
-const command = args[0];
+// Allow global flags before the command, e.g. `--yes migrate`.
+const command = args.find((arg) => !arg.startsWith("-"));
+const positional = args.filter((arg) => !arg.startsWith("-") && arg !== command);
 
 function showHelp() {
   console.log(colors.bold.cyan("\n============================================================="));
@@ -32,7 +34,7 @@ function showHelp() {
   console.log(colors.green("  migrate:status            ") + colors.gray("Muestra el estado de migraciones aplicadas"));
   console.log(colors.green("  migrate:rollback          ") + colors.gray("Revierte el último lote de migraciones"));
   console.log(colors.green("  make:seed <name>          ") + colors.gray("Crea un archivo de seed en database/seeds/"));
-  console.log(colors.green("  seed                      ") + colors.gray("Ejecuta todos los seeds pendientes"));
+  console.log(colors.green("  seed [--force]            ") + colors.gray("Ejecuta los seeds pendientes (--force re-ejecuta todos)"));
   console.log(colors.green("  make:ecosystem            ") + colors.gray("Genera ecosystem.config.cjs para PM2 en VPS"));
   console.log(colors.green("  nginx:conf [domain]       ") + colors.gray("Genera configuración Nginx y comandos Certbot"));
   console.log(colors.green("  make:desktop              ") + colors.gray("Scaffold de Nextron/Electron (Win, Mac, Linux, Portable)"));
@@ -52,13 +54,11 @@ async function run() {
   switch (command) {
     case "make:model":
     case "model": {
-      const name = args.find((a, i) => i > 0 && !a.startsWith("-"));
-      makeModel(name);
+      makeModel(positional[0]);
       break;
     }
     case "make:migration": {
-      const name = args.find((a, i) => i > 0 && !a.startsWith("-"));
-      await makeMigration(name, null, autoYes);
+      await makeMigration(positional[0], null, autoYes);
       break;
     }
     case "migrate": {
@@ -74,12 +74,11 @@ async function run() {
       break;
     }
     case "make:seed": {
-      const name = args.find((a, i) => i > 0 && !a.startsWith("-"));
-      makeSeed(name);
+      makeSeed(positional[0]);
       break;
     }
     case "seed": {
-      await runSeeds();
+      await runSeeds(args.includes("--force"));
       break;
     }
     case "make:ecosystem":
@@ -103,7 +102,8 @@ async function run() {
       break;
     }
     case "ws:start": {
-      const port = parseInt(args[1] || process.env.WS_PORT || "3001", 10);
+      const portArg = args.find((arg) => /^\d+$/.test(arg)) || process.env.WS_PORT || "3001";
+      const port = parseInt(portArg, 10);
       new WebSocketManager({ port });
       break;
     }

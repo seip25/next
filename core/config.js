@@ -5,6 +5,18 @@ let _cachedProps = null;
 let _customUserDataDir = null;
 let _customAppDir = null;
 
+const ASAR_SEGMENT = /(?:^|[\\/])app\.asar(?:[\\/]|$)/;
+
+/**
+ * Detects a path inside a packaged Electron archive.
+ * Avoids false positives from directories whose name merely contains ".asar".
+ * @param {string} [value]
+ * @returns {boolean}
+ */
+function isAsarPath(value) {
+  return ASAR_SEGMENT.test(String(value || ""));
+}
+
 /**
  * Configuration class to manage Next.js environment settings,
  * directory paths, and Electron/Nextron desktop persistent storage.
@@ -47,7 +59,6 @@ class Config {
     return Boolean(
       process.versions?.electron ||
       process.env.DESKTOP_MODE === "true" ||
-      process.env.ELECTRON_RUN_AS_NODE ||
       _customUserDataDir ||
       _customAppDir
     );
@@ -78,8 +89,8 @@ class Config {
     const appDir = this.appDir();
 
     if (
-      cwd.includes(".asar") ||
-      appDir.includes(".asar") ||
+      isAsarPath(cwd) ||
+      isAsarPath(appDir) ||
       this.isDesktop()
     ) {
       const appName = (process.env.APP_NAME || process.env.TITLE || "seip-app")

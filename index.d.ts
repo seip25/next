@@ -101,6 +101,7 @@ export class Auth {
     }
   ): Promise<Response | null>;
   static user(cookiesOrRequest?: any, cookieKey?: string): Promise<any>;
+  static revoke(token: string): boolean;
   static login(
     data: any,
     options?: {

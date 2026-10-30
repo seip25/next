@@ -15,6 +15,7 @@ import {
   Model,
   escapeXss,
 } from "../index.js";
+import { toPostgresSql } from "../core/database.js";
 
 test("Config: props and desktop detection", () => {
   const props = Config.props();
@@ -489,5 +490,184 @@ test("Database: concurrent SQLite transactions are serialized", async () => {
     assert.equal(rows.n, 2);
   } finally {
     await db.close();
+  }
+});
+
+test("Database: toPostgresSql ignores literals, comments, dollar-quotes and JSON operator", () => {
+  assert.equal(
+    toPostgresSql("SELECT * FROM t WHERE a = ? AND b = '?'"),
+    "SELECT * FROM t WHERE a = $1 AND b = '?'"
+  );
+  assert.equal(
+    toPostgresSql("SELECT * FROM t -- comment ?\nWHERE x = ?"),
+    "SELECT * FROM t -- comment ?\nWHERE x = $1"
+  );
+  assert.equal(
+    toPostgresSql("SELECT * FROM t /* ? */ WHERE x = ?"),
+    "SELECT * FROM t /* ? */ WHERE x = $1"
+  );
+  assert.equal(
+    toPostgresSql("SELECT $tag$ ? $tag$, ?"),
+    "SELECT $tag$ ? $tag$, $1"
+  );
+  // Escaped \? is the Postgres JSON operator, not a placeholder.
+  assert.equal(
+    toPostgresSql("SELECT * FROM t WHERE data \\? 'key' AND id = ?"),
+    "SELECT * FROM t WHERE data ? 'key' AND id = $1"
+  );
+});
+
+test("Model: string/UUID primary keys keep their type in DDL", () => {
+  class UuidModel extends Model {
+    static table = "uuids";
+    static schema = {
+      id: { type: "uuid", primary: true, auto: true },
+      slug: { type: "string", primary: false },
+    };
+  }
+
+  const sqliteDdl = UuidModel.toDDL("sqlite");
+  const pgDdl = UuidModel.toDDL("postgres");
+  const mysqlDdl = UuidModel.toDDL("mysql");
+
+  assert.match(sqliteDdl, /id TEXT PRIMARY KEY NOT NULL/);
+  assert.doesNotMatch(sqliteDdl, /AUTOINCREMENT/);
+  assert.match(pgDdl, /id UUID PRIMARY KEY NOT NULL DEFAULT gen_random_uuid\(\)/);
+  assert.doesNotMatch(pgDdl, /SERIAL/);
+  assert.match(mysqlDdl, /id CHAR\(36\) PRIMARY KEY NOT NULL/);
+
+  class StringPk extends Model {
+    static table = "slugs";
+    static schema = {
+      id: { type: "string", primary: true },
+      name: { type: "string" },
+    };
+  }
+  assert.match(StringPk.toDDL("sqlite"), /id VARCHAR\(255\) PRIMARY KEY NOT NULL/);
+  assert.doesNotMatch(StringPk.toDDL("postgres"), /SERIAL/);
+});
+
+test("Model: DDL escapes string defaults and maps booleans", () => {
+  class Defaults extends Model {
+    static table = "defaults_test";
+    static schema = {
+      id: { type: "int", primary: true, auto: true },
+      title: { type: "string", default: "O'Reilly" },
+      active: { type: "boolean", default: true },
+      score: { type: "int", default: 0 },
+      computed: { type: "string", default: () => "fn" },
+    };
+  }
+
+  const sqliteDdl = Defaults.toDDL("sqlite");
+  assert.match(sqliteDdl, /DEFAULT 'O''Reilly'/);
+  assert.match(sqliteDdl, /active INTEGER DEFAULT 1/);
+  assert.match(sqliteDdl, /score INT DEFAULT 0/);
+  assert.doesNotMatch(sqliteDdl, /DEFAULT \(\)/); // function defaults are not valid DDL
+  assert.doesNotMatch(sqliteDdl, /computed.*DEFAULT/);
+
+  const pgDdl = Defaults.toDDL("postgres");
+  assert.match(pgDdl, /active BOOLEAN DEFAULT TRUE/);
+});
+
+test("Config: desktop detection ignores ELECTRON_RUN_AS_NODE", () => {
+  if (process.versions?.electron) return; // Real Electron runtime: nothing to assert.
+  const previous = process.env.ELECTRON_RUN_AS_NODE;
+  process.env.ELECTRON_RUN_AS_NODE = "1";
+  try {
+    assert.equal(Config.isDesktop(), false);
+  } finally {
+    if (previous === undefined) delete process.env.ELECTRON_RUN_AS_NODE;
+    else process.env.ELECTRON_RUN_AS_NODE = previous;
+  }
+});
+
+test("Model: UUID primary keys are generated and returned by create", async () => {
+  const db = new Database(1, 0, { DB_TYPE: "sqlite", DB_FILE: ":memory:" });
+  await db.init();
+
+  class Item extends Model {
+    static table = "uuid_items";
+    static schema = {
+      id: { type: "uuid", primary: true, auto: true },
+      name: { type: "string", required: true },
+    };
+  }
+  Item.setDatabase(db);
+
+  try {
+    await db.query(Item.toDDL("sqlite"));
+    const id = await Item.create({ name: "x" });
+    assert.match(String(id), /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+
+    const found = await Item.find(id);
+    assert.equal(found.name, "x");
+  } finally {
+    Item.setDatabase(null);
+    await db.close();
+  }
+});
+
+test("CLI: JS migrations run, seeds are tracked and rollback undoes the batch", async () => {
+  const originalCwd = process.cwd();
+  const originalLog = console.log;
+  const tmp = fs.mkdtempSync(path.join(originalCwd, "tmp-cli-"));
+  let databaseModule = null;
+
+  try {
+    fs.mkdirSync(path.join(tmp, "database", "migrations"), { recursive: true });
+    fs.mkdirSync(path.join(tmp, "database", "seeds"), { recursive: true });
+
+    fs.writeFileSync(
+      path.join(tmp, "database", "migrations", "001_init.sql"),
+      "-- Up\nCREATE TABLE widgets (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);\n-- Down\nDROP TABLE IF EXISTS widgets;\n",
+      "utf-8"
+    );
+    fs.writeFileSync(
+      path.join(tmp, "database", "migrations", "002_js.mjs"),
+      'export async function up(tx) {\n  await tx.query("CREATE TABLE js_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)");\n}\nexport async function down(tx) {\n  await tx.query("DROP TABLE IF EXISTS js_items");\n}\n',
+      "utf-8"
+    );
+    fs.writeFileSync(
+      path.join(tmp, "database", "seeds", "widgets.sql"),
+      "INSERT INTO widgets (name) VALUES ('one');\n",
+      "utf-8"
+    );
+
+    process.chdir(tmp);
+    console.log = () => {};
+
+    const migrations = await import("../core/cli/migrate.js");
+    await migrations.runMigrations(false);
+
+    databaseModule = await import("../core/database.js");
+    const db = databaseModule.database;
+
+    const tables = await db.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name");
+    const names = tables.map((row) => row.name);
+    assert.ok(names.includes("widgets"), "SQL migration must run");
+    assert.ok(names.includes("js_items"), "JS migration must run");
+
+    await migrations.runSeeds();
+    await migrations.runSeeds(); // second run must skip already executed seeds
+
+    const seedRows = await db.query("SELECT name FROM _seip_seeds");
+    assert.equal(seedRows.length, 1, "seeds must be tracked");
+    const widgetCount = await db.query("SELECT COUNT(*) as c FROM widgets", [], { return_row: true });
+    assert.equal(widgetCount.c, 1, "seeds must not run twice");
+
+    await migrations.rollbackMigrations();
+
+    const afterRollback = await db.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name");
+    const afterNames = afterRollback.map((row) => row.name);
+    assert.ok(!afterNames.includes("js_items"), "JS down() must run on rollback");
+    assert.ok(!afterNames.includes("widgets"), "SQL Down section must run on rollback");
+  } finally {
+    console.log = originalLog;
+    process.chdir(originalCwd);
+    if (databaseModule) {
+      await databaseModule.database.close();
+    }
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
 });

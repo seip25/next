@@ -87,7 +87,11 @@ if (DB_TYPE === "postgres") {
 }
 
 /**
- * Replaces ? parameter placeholders with $1, $2, etc., ignoring quoted string literals.
+ * Replaces ? parameter placeholders with $1, $2, etc., ignoring:
+ *  - single/double quoted literals and identifiers,
+ *  - line (--) and block comments,
+ *  - dollar-quoted strings ($$...$$, $tag$...$tag$).
+ * Use `\?` for a literal Postgres JSON operator `?` (e.g. WHERE data \? 'key').
  * @param {string} sql
  * @returns {string}
  */
@@ -95,12 +99,62 @@ function toPostgresSql(sql) {
   let paramIndex = 1;
   let inSingleQuote = false;
   let inDoubleQuote = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+  let dollarTag = null;
   let result = "";
 
   for (let i = 0; i < sql.length; i++) {
     const char = sql[i];
     const nextChar = sql[i + 1];
-    const prev = i > 0 ? sql[i - 1] : "";
+
+    if (inLineComment) {
+      result += char;
+      if (char === "\n") inLineComment = false;
+      continue;
+    }
+
+    if (inBlockComment) {
+      result += char;
+      if (char === "*" && nextChar === "/") {
+        result += nextChar;
+        i++;
+        inBlockComment = false;
+      }
+      continue;
+    }
+
+    if (dollarTag) {
+      if (char === "$" && sql.startsWith(dollarTag, i)) {
+        result += dollarTag;
+        i += dollarTag.length - 1;
+        dollarTag = null;
+        continue;
+      }
+      result += char;
+      continue;
+    }
+
+    if (!inSingleQuote && !inDoubleQuote && char === "-" && nextChar === "-") {
+      result += "--";
+      i++;
+      inLineComment = true;
+      continue;
+    }
+
+    if (!inSingleQuote && !inDoubleQuote && char === "/" && nextChar === "*") {
+      result += "/*";
+      i++;
+      inBlockComment = true;
+      continue;
+    }
+
+    // Escaped literal operator: \? -> ? (not a placeholder).
+    if (char === "\\" && nextChar === "?") {
+      result += "?";
+      i++;
+      continue;
+    }
 
     if (char === "'" && !inDoubleQuote) {
       if (inSingleQuote && nextChar === "'") {
@@ -108,25 +162,38 @@ function toPostgresSql(sql) {
         i++;
         continue;
       }
-      if (prev !== "\\") {
-        inSingleQuote = !inSingleQuote;
-      }
+      inSingleQuote = !inSingleQuote;
       result += char;
-    } else if (char === '"' && !inSingleQuote) {
+      continue;
+    }
+
+    if (char === '"' && !inSingleQuote) {
       if (inDoubleQuote && nextChar === '"') {
         result += '""';
         i++;
         continue;
       }
-      if (prev !== "\\") {
-        inDoubleQuote = !inDoubleQuote;
-      }
+      inDoubleQuote = !inDoubleQuote;
       result += char;
-    } else if (char === "?" && !inSingleQuote && !inDoubleQuote) {
-      result += `$${paramIndex++}`;
-    } else {
-      result += char;
+      continue;
     }
+
+    if (!inSingleQuote && !inDoubleQuote && char === "$") {
+      const match = /^\$[A-Za-z_][A-Za-z0-9_]*\$|^\$\$/.exec(sql.slice(i));
+      if (match) {
+        dollarTag = match[0];
+        result += dollarTag;
+        i += dollarTag.length - 1;
+        continue;
+      }
+    }
+
+    if (char === "?" && !inSingleQuote && !inDoubleQuote) {
+      result += `$${paramIndex++}`;
+      continue;
+    }
+
+    result += char;
   }
 
   return result;
@@ -757,5 +824,5 @@ if (!globalThis.__seip_next_db_instance) {
 const database = globalThis.__seip_next_db_instance;
 const db = database;
 
-export { Database, database, db, DB_TYPE };
+export { Database, database, db, DB_TYPE, toPostgresSql };
 export default database;

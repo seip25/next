@@ -126,23 +126,30 @@ module.exports = {
     fs.mkdirSync(path.join(cwd, "logs"), { recursive: true });
     fs.writeFileSync(outputPath, fileContent, "utf-8");
     console.log(colors.green(`[OK] Generated ecosystem.config.cjs for '${appName}' (port: ${port}).`));
+  } catch (err) {
+    console.error(colors.red("[ERROR] Failed to generate ecosystem.config.cjs:"), err.message);
+    process.exitCode = 1;
+    return;
+  }
 
-    const shouldStart = process.argv.includes("--start");
-    if (shouldStart) {
-      console.log(colors.cyan("[INFO] Starting application with PM2..."));
+  const shouldStart = process.argv.includes("--start");
+  if (shouldStart) {
+    console.log(colors.cyan("[INFO] Starting application with PM2..."));
+    try {
       execSync("pm2 start ecosystem.config.cjs", { stdio: "inherit", cwd });
       execSync("pm2 save", { stdio: "inherit", cwd });
       console.log(colors.green("[OK] PM2 processes started and state saved."));
-    } else {
-      console.log("");
-      console.log(colors.bold("Comandos para levantar en VPS con PM2:"));
-      console.log(colors.cyan("  pm2 start ecosystem.config.cjs"));
-      console.log(colors.cyan("  pm2 save"));
-      console.log(colors.cyan("  pm2 startup"));
-      console.log("");
+    } catch (err) {
+      console.error(colors.red("[ERROR] PM2 failed to start the application:"), err.message);
+      process.exitCode = 1;
     }
-  } catch (err) {
-    console.error(colors.red("[ERROR] Failed to generate ecosystem.config.cjs:"), err.message);
+  } else {
+    console.log("");
+    console.log(colors.bold("Comandos para levantar en VPS con PM2:"));
+    console.log(colors.cyan("  pm2 start ecosystem.config.cjs"));
+    console.log(colors.cyan("  pm2 save"));
+    console.log(colors.cyan("  pm2 startup"));
+    console.log("");
   }
 }
 

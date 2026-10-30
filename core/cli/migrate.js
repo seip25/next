@@ -34,6 +34,53 @@ function getTimestamp() {
   return `${year}${month}${day}_${hours}${mins}${secs}`;
 }
 
+/**
+ * True only for "table does not exist" driver errors. Any other failure
+ * (connection refused, missing driver, permissions) must not be mistaken
+ * for an absent table, otherwise the CLI generates bogus migrations.
+ * @param {any} err
+ * @returns {boolean}
+ */
+function isMissingTableError(err) {
+  if (!err) return false;
+  if (String(err.code || "").toUpperCase() === "42P01") return true; // Postgres undefined_table
+  const message = String(err.message || err).toLowerCase();
+  return (
+    message.includes("no such table") ||
+    message.includes("doesn't exist") ||
+    message.includes("does not exist") ||
+    message.includes("er_no_such_table")
+  );
+}
+
+/**
+ * Ensures the seeds tracking table exists (idempotent).
+ * @param {import('../database.js').Database} db
+ */
+export async function ensureSeedsTable(db) {
+  const nameType = db.type === "sqlite" ? "TEXT" : "VARCHAR(255)";
+  await db.query(
+    `CREATE TABLE IF NOT EXISTS _seip_seeds (name ${nameType} PRIMARY KEY, executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`
+  );
+}
+
+/**
+ * Returns a non-existing path, appending _2, _3... to avoid overwriting
+ * files generated within the same second (timestamps have second resolution).
+ * @param {string} dir
+ * @param {string} baseName
+ * @returns {string}
+ */
+function uniquePath(dir, baseName) {
+  let candidate = path.join(dir, baseName);
+  if (!fs.existsSync(candidate)) return candidate;
+  const ext = path.extname(baseName);
+  const stem = baseName.slice(0, baseName.length - ext.length);
+  let n = 2;
+  while (fs.existsSync(path.join(dir, `${stem}_${n}${ext}`))) n++;
+  return path.join(dir, `${stem}_${n}${ext}`);
+}
+
 export function splitSqlStatements(sqlText) {
   const statements = [];
   let current = "";
@@ -94,30 +141,33 @@ export function splitSqlStatements(sqlText) {
 }
 
 export async function inspectDatabaseSchema(db, tableName) {
+  let rows;
   try {
     if (db.type === "sqlite") {
-      const rows = (await db.query(`PRAGMA table_info("${tableName}")`)) || [];
-      if (!Array.isArray(rows) || rows.length === 0) return { exists: false, columns: [] };
-      return { exists: true, columns: rows.map((r) => r.name) };
+      rows = await db.query(`PRAGMA table_info("${tableName}")`);
+    } else if (db.type === "mysql") {
+      rows = await db.query(`SHOW COLUMNS FROM \`${tableName}\``);
+    } else if (db.type === "postgres") {
+      rows = await db.query(
+        "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = ?",
+        [tableName]
+      );
+    } else {
+      throw new Error(`[MIGRATE ERROR] Unsupported database type '${db.type}'.`);
     }
-    if (db.type === "mysql") {
-      const rows = (await db.query(`SHOW COLUMNS FROM \`${tableName}\``)) || [];
-      if (!Array.isArray(rows) || rows.length === 0) return { exists: false, columns: [] };
-      return { exists: true, columns: rows.map((r) => r.Field) };
-    }
-    if (db.type === "postgres") {
-      const rows =
-        (await db.query(
-          "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = ?",
-          [tableName]
-        )) || [];
-      if (!Array.isArray(rows) || rows.length === 0) return { exists: false, columns: [] };
-      return { exists: true, columns: rows.map((r) => r.column_name) };
-    }
-  } catch {
-    return { exists: false, columns: [] };
+  } catch (err) {
+    if (isMissingTableError(err)) return { exists: false, columns: [] };
+    throw err;
   }
-  return { exists: false, columns: [] };
+
+  if (rows === false) {
+    throw new Error("[MIGRATE ERROR] Database connection is not available.");
+  }
+  if (!Array.isArray(rows) || rows.length === 0) return { exists: false, columns: [] };
+
+  if (db.type === "sqlite") return { exists: true, columns: rows.map((r) => r.name) };
+  if (db.type === "mysql") return { exists: true, columns: rows.map((r) => r.Field) };
+  return { exists: true, columns: rows.map((r) => r.column_name) };
 }
 
 export async function loadAllModels() {
@@ -238,7 +288,13 @@ export async function makeMigration(name, modelName = null, autoRun = false) {
   }
 
   const db = database;
-  await db.init();
+  const initialized = await db.init();
+  if (!initialized) {
+    throw new Error(
+      `[MIGRATE ERROR] Could not connect to the database (type: ${db.type}). ` +
+        "Check DB_* / DATABASE_URL and that the driver is installed."
+    );
+  }
 
   const targetModels = await loadAllModels();
   const { missingTables, missingColumns } = await detectModelDiffs(db, targetModels);
@@ -269,8 +325,8 @@ export async function makeMigration(name, modelName = null, autoRun = false) {
     }
 
     const migrationTitle = cleanName || "auto_migration";
-    const filename = `${getTimestamp()}_${migrationTitle}.sql`;
-    const filePath = path.join(migrationsDir, filename);
+    const filePath = uniquePath(migrationsDir, `${getTimestamp()}_${migrationTitle}.sql`);
+    const filename = path.basename(filePath);
 
     const template = `-- =============================================================\n-- Migration: ${migrationTitle}\n-- Driver: ${db.type}\n-- Created: ${new Date().toISOString()}\n-- =============================================================\n\n-- Up\n${upBlocks.join("\n\n")}\n\n-- Down\n${downBlocks.join("\n")}\n`;
 
@@ -284,8 +340,8 @@ export async function makeMigration(name, modelName = null, autoRun = false) {
     return;
   }
 
-  const filename = `${getTimestamp()}_${cleanName || "custom_migration"}.sql`;
-  const filePath = path.join(migrationsDir, filename);
+  const filePath = uniquePath(migrationsDir, `${getTimestamp()}_${cleanName || "custom_migration"}.sql`);
+  const filename = path.basename(filePath);
   const template = `-- =============================================================\n-- Migration: ${cleanName}\n-- Driver: ${db.type}\n-- Created: ${new Date().toISOString()}\n-- =============================================================\n\n-- Up\n\n-- Down\n`;
 
   fs.writeFileSync(filePath, template, "utf-8");
@@ -299,7 +355,13 @@ export async function runMigrations(exitOnFinish = true) {
   }
 
   const db = database;
-  await db.init();
+  const initialized = await db.init();
+  if (!initialized) {
+    const message = `[MIGRATE ERROR] Could not connect to the database (type: ${db.type}).`;
+    console.error(colors.red(message));
+    if (exitOnFinish) process.exit(1);
+    throw new Error(message);
+  }
   await ensureMigrationsTable(db);
 
   const files = fs
@@ -346,12 +408,27 @@ export async function runMigrations(exitOnFinish = true) {
             [file, currentBatch]
           );
         });
+      } else if (file.endsWith(".js") || file.endsWith(".mjs")) {
+        const mod = await import(pathToFileURL(filePath).href);
+        const up = mod.up || (mod.default && mod.default.up);
+        if (typeof up !== "function") {
+          throw new Error("JS migration must export an async up(tx) function.");
+        }
+        await db.transaction(async (tx) => {
+          await up(tx);
+          await tx.query(
+            "INSERT INTO _seip_migrations (name, batch) VALUES (?, ?)",
+            [file, currentBatch]
+          );
+        });
+      } else {
+        throw new Error("Unsupported migration file type.");
       }
       console.log(colors.green(`  [MIGRATED] ${file}`));
     } catch (err) {
       console.error(colors.red(`  [FAILED]   ${file}: ${err.message}`));
       if (exitOnFinish) process.exit(1);
-      return;
+      throw err;
     }
   }
 
@@ -362,7 +439,11 @@ export async function runMigrations(exitOnFinish = true) {
 export async function rollbackMigrations() {
   const migrationsDir = path.resolve(process.cwd(), "database/migrations");
   const db = database;
-  await db.init();
+  const initialized = await db.init();
+  if (!initialized) {
+    console.error(colors.red(`[MIGRATE ERROR] Could not connect to the database (type: ${db.type}).`));
+    process.exit(1);
+  }
   await ensureMigrationsTable(db);
 
   const maxBatchRow = await db.query("SELECT MAX(batch) as max_batch FROM _seip_migrations", [], { return_row: true });
@@ -381,23 +462,37 @@ export async function rollbackMigrations() {
     const filePath = path.join(migrationsDir, file);
 
     try {
-      if (fs.existsSync(filePath) && file.endsWith(".sql")) {
+      if (!fs.existsSync(filePath)) {
+        throw new Error("Migration file not found; refusing to drop its history row silently.");
+      }
+
+      if (file.endsWith(".sql")) {
         const content = fs.readFileSync(filePath, "utf-8");
         const downParts = content.split(/--\s*Down/i);
-        if (downParts.length > 1) {
-          const downStatements = splitSqlStatements(downParts[1]);
-          await db.transaction(async (tx) => {
-            for (const stmt of downStatements) {
-              await tx.query(stmt);
-            }
-            await tx.query("DELETE FROM _seip_migrations WHERE name = ?", [file]);
-          });
-        } else {
-          await db.query("DELETE FROM _seip_migrations WHERE name = ?", [file]);
+        if (downParts.length <= 1) {
+          throw new Error("Migration has no '-- Down' section; refusing to mark it rolled back.");
         }
+        const downStatements = splitSqlStatements(downParts[1]);
+        await db.transaction(async (tx) => {
+          for (const stmt of downStatements) {
+            await tx.query(stmt);
+          }
+          await tx.query("DELETE FROM _seip_migrations WHERE name = ?", [file]);
+        });
+      } else if (file.endsWith(".js") || file.endsWith(".mjs")) {
+        const mod = await import(pathToFileURL(filePath).href);
+        const down = mod.down || (mod.default && mod.default.down);
+        if (typeof down !== "function") {
+          throw new Error("JS migration has no down(tx) export; refusing to mark it rolled back.");
+        }
+        await db.transaction(async (tx) => {
+          await down(tx);
+          await tx.query("DELETE FROM _seip_migrations WHERE name = ?", [file]);
+        });
       } else {
-        await db.query("DELETE FROM _seip_migrations WHERE name = ?", [file]);
+        throw new Error("Unsupported migration file type.");
       }
+
       console.log(colors.green(`  [ROLLED BACK] ${file}`));
     } catch (err) {
       console.error(colors.red(`  [FAILED]      ${file}: ${err.message}`));
@@ -415,9 +510,13 @@ export async function showMigrationStatus() {
     return;
   }
 
-  const files = fs.readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort();
+  const files = fs.readdirSync(migrationsDir).filter((f) => /\.(sql|js|mjs)$/.test(f)).sort();
   const db = database;
-  await db.init();
+  const initialized = await db.init();
+  if (!initialized) {
+    console.error(colors.red(`[MIGRATE ERROR] Could not connect to the database (type: ${db.type}).`));
+    process.exit(1);
+  }
   await ensureMigrationsTable(db);
 
   const appliedRows = (await db.query("SELECT name, batch, executed_at FROM _seip_migrations ORDER BY id ASC")) || [];
@@ -435,6 +534,16 @@ export async function showMigrationStatus() {
       console.log(`  ${colors.yellow("[PENDING]")}  ${file}`);
     }
   }
+
+  const knownFiles = new Set(files);
+  const orphans = appliedRows.filter((row) => !knownFiles.has(row.name));
+  if (orphans.length > 0) {
+    console.log(colors.yellow("\n[WARN] Applied migrations without a matching file:"));
+    for (const row of orphans) {
+      console.log(`  ${colors.yellow("[ORPHAN]")} ${row.name} (Batch: ${row.batch})`);
+    }
+  }
+
   console.log("");
 }
 
@@ -449,13 +558,14 @@ export function makeSeed(name) {
   const seedsDir = path.resolve(process.cwd(), "database/seeds");
   if (!fs.existsSync(seedsDir)) fs.mkdirSync(seedsDir, { recursive: true });
 
-  const filePath = path.join(seedsDir, `${cleanName}.sql`);
+  const filePath = uniquePath(seedsDir, `${cleanName}.sql`);
+  const filename = path.basename(filePath);
   const template = `-- Seed: ${cleanName}\n-- INSERT INTO ${cleanName} (name) VALUES ('Sample 1');\n`;
   fs.writeFileSync(filePath, template, "utf-8");
-  console.log(colors.green(`[OK] Seed file created: database/seeds/${cleanName}.sql`));
+  console.log(colors.green(`[OK] Seed file created: database/seeds/${filename}`));
 }
 
-export async function runSeeds() {
+export async function runSeeds(force = false) {
   const seedsDir = path.resolve(process.cwd(), "database/seeds");
   if (!fs.existsSync(seedsDir)) {
     console.log(colors.yellow("[INFO] No seeds found in database/seeds."));
@@ -464,17 +574,39 @@ export async function runSeeds() {
 
   const files = fs.readdirSync(seedsDir).filter((f) => f.endsWith(".sql")).sort();
   const db = database;
-  await db.init();
+  const initialized = await db.init();
+  if (!initialized) {
+    console.error(colors.red(`[MIGRATE ERROR] Could not connect to the database (type: ${db.type}).`));
+    process.exit(1);
+  }
+  await ensureSeedsTable(db);
 
+  const appliedRows = (await db.query("SELECT name FROM _seip_seeds")) || [];
+  const applied = new Set(appliedRows.map((row) => row.name));
+
+  let executed = 0;
   for (const file of files) {
+    if (!force && applied.has(file)) {
+      console.log(colors.yellow(`  [SKIPPED] ${file} (already executed - use --force to re-run)`));
+      continue;
+    }
+
     const sql = fs.readFileSync(path.join(seedsDir, file), "utf-8");
     const stmts = splitSqlStatements(sql);
     await db.transaction(async (tx) => {
       for (const s of stmts) await tx.query(s);
+      await tx.query("DELETE FROM _seip_seeds WHERE name = ?", [file]);
+      await tx.query("INSERT INTO _seip_seeds (name) VALUES (?)", [file]);
     });
     console.log(colors.green(`  [SEEDED] ${file}`));
+    executed++;
   }
-  console.log(colors.bold.green("\n[OK] All seeds executed."));
+
+  if (executed === 0) {
+    console.log(colors.green("\n[INFO] No pending seeds."));
+    return;
+  }
+  console.log(colors.bold.green(`\n[OK] ${executed} seed(s) executed.`));
 }
 
 const isMain = process.argv[1] && (
@@ -497,7 +629,7 @@ if (isMain) {
   } else if (cmd === "make:seed") {
     makeSeed(rawArgs[1]);
   } else if (cmd === "seed") {
-    await runSeeds();
+    await runSeeds(rawArgs.includes("--force"));
   } else {
     await runMigrations(true);
   }
