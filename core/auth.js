@@ -7,17 +7,84 @@ import {
   randomBytes,
   randomUUID,
 } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import Config from "./config.js";
 
-const revokedSessions = new Map();
+/**
+ * Revoked session ids (id -> expiry ms). Stored on globalThis because Next.js may
+ * evaluate this module several times (proxy.js bundle, route handlers, server actions):
+ * a module-level Map would let a session revoked in a Server Action still pass proxy.js.
+ */
+const revocationState = (globalThis.__seip_next_revoked_sessions ??= {
+  map: new Map(),
+  loadedFrom: null,
+  mtimeMs: 0,
+});
+const revokedSessions = revocationState.map;
 
-setInterval(() => {
-  if (revokedSessions.size === 0) return;
-  const now = Date.now();
+/**
+ * File used to persist revocations across restarts (pm2 restart / deploy).
+ * - AUTH_REVOCATION_FILE=<path> → that file
+ * - AUTH_REVOCATION_FILE=false  → memory only
+ * - default: <userDataDir>/database/.revoked-sessions.json in production, memory-only otherwise.
+ * @returns {string|null}
+ */
+function revocationFile() {
+  const configured = process.env.AUTH_REVOCATION_FILE;
+  if (configured === "false" || configured === "0") return null;
+  if (configured) return path.resolve(Config.userDataDir(), configured);
+  if (process.env.NODE_ENV !== "production") return null;
+  return path.join(Config.userDataDir(), "database", ".revoked-sessions.json");
+}
+
+function pruneRevoked(now = Date.now()) {
   for (const [id, exp] of revokedSessions) {
     if (exp <= now) revokedSessions.delete(id);
   }
-}, 300000).unref();
+}
+
+/** Reloads revocations written by another module instance/process when the file changed. */
+function syncRevocationsFromDisk() {
+  const file = revocationFile();
+  if (!file) return;
+  try {
+    const stat = fs.statSync(file);
+    if (revocationState.loadedFrom === file && stat.mtimeMs === revocationState.mtimeMs) return;
+    const data = JSON.parse(fs.readFileSync(file, "utf8"));
+    const now = Date.now();
+    for (const [id, exp] of Object.entries(data || {})) {
+      if (typeof exp === "number" && exp > now) revokedSessions.set(id, exp);
+    }
+    revocationState.loadedFrom = file;
+    revocationState.mtimeMs = stat.mtimeMs;
+  } catch {
+    // Missing or unreadable file: keep the in-memory state.
+  }
+}
+
+function persistRevocations() {
+  const file = revocationFile();
+  if (!file) return;
+  try {
+    pruneRevoked();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(revokedSessions)), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    revocationState.loadedFrom = file;
+    revocationState.mtimeMs = fs.statSync(file).mtimeMs;
+  } catch (err) {
+    console.error("[AUTH ERROR] Could not persist revoked sessions:", err.message);
+  }
+}
+
+if (!revocationState.timer) {
+  revocationState.timer = setInterval(() => {
+    if (revokedSessions.size > 0) pruneRevoked();
+  }, 300000);
+  revocationState.timer.unref?.();
+}
 
 const MIN_SECRET_LENGTH = 32;
 let warnedMissingSecret = false;
@@ -70,16 +137,18 @@ function escapeRegExp(value) {
 }
 
 function parseDuration(duration) {
-  if (typeof duration === "number") return duration;
-  const match = String(duration).match(/^(\d+)([smhd])$/);
-  if (!match) return 86400;
+  if (typeof duration === "number" && Number.isFinite(duration) && duration > 0) return Math.floor(duration);
+  const match = String(duration).trim().match(/^(\d+)\s*([smhdw])$/i);
+  if (!match) {
+    // A silent fallback would turn "30 days" or "1y" into a 1-day session without notice.
+    throw new Error(
+      `[AUTH ERROR] Invalid expiresIn '${duration}'. Use seconds (number) or a string like "15m", "12h", "7d", "2w".`
+    );
+  }
   const val = parseInt(match[1], 10);
-  const unit = match[2];
-  if (unit === "s") return val;
-  if (unit === "m") return val * 60;
-  if (unit === "h") return val * 3600;
-  if (unit === "d") return val * 86400;
-  return 86400;
+  const unit = match[2].toLowerCase();
+  const factors = { s: 1, m: 60, h: 3600, d: 86400, w: 604800 };
+  return val * factors[unit];
 }
 
 /**
@@ -172,8 +241,9 @@ class Auth {
       if (Math.floor(Date.now() / 1000) >= decoded.exp) return null;
 
       const payload = this.decrypt(decoded.data, resolvedSecret);
-      if (payload && payload._sessionId && revokedSessions.has(payload._sessionId)) {
-        return null;
+      if (payload && payload._sessionId) {
+        syncRevocationsFromDisk();
+        if (revokedSessions.has(payload._sessionId)) return null;
       }
 
       return payload;
@@ -217,7 +287,7 @@ class Auth {
     // Extract token from Cookie or Authorization header
     let token = null;
     if (request.cookies?.get) {
-      token = request.cookies.get(cookieKey)?.value;
+      token = request.cookies.get(cookieKey)?.value || null;
     } else if (typeof request.headers?.get === "function") {
       const cookieHeader = request.headers.get("cookie") || "";
       const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${escapeRegExp(cookieKey)}=([^;]+)`));
@@ -228,11 +298,12 @@ class Auth {
           token = null; // Malformed percent-encoding must not crash the proxy.
         }
       }
-      if (!token) {
-        const authHeader = request.headers.get("authorization");
-        if (authHeader && authHeader.startsWith("Bearer ")) {
-          token = authHeader.slice(7).trim();
-        }
+    }
+    // API clients send "Authorization: Bearer <token>" (also with NextRequest, which always has .cookies).
+    if (!token && typeof request.headers?.get === "function") {
+      const authHeader = request.headers.get("authorization");
+      if (authHeader && /^Bearer\s+/i.test(authHeader)) {
+        token = authHeader.replace(/^Bearer\s+/i, "").trim() || null;
       }
     }
 
@@ -370,7 +441,9 @@ class Auth {
     const payload = this.verifyToken(token);
     if (!payload || !payload._sessionId) return false;
     const expMs = tokenExpiryMs(token) || Date.now() + 7 * 24 * 3600 * 1000;
+    syncRevocationsFromDisk();
     revokedSessions.set(payload._sessionId, expMs);
+    persistRevocations();
     return true;
   }
 

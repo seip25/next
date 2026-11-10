@@ -1,11 +1,15 @@
 export interface QueryOptions {
   return_row?: boolean;
+  /** Do not log the error to the console (it is still thrown). */
+  silent?: boolean;
   [key: string]: any;
 }
 
 export interface PaginateOptions {
   page?: number;
   limit?: number;
+  /** Upper bound for `limit` (default 100) so `?limit=1000000` cannot dump a table. */
+  maxLimit?: number;
 }
 
 export interface PaginateResult<T = any> {
@@ -17,6 +21,7 @@ export interface PaginateResult<T = any> {
 }
 
 export class Database {
+  constructor(connectionLimit?: number, queueLimit?: number, config?: Record<string, any>);
   type: string;
   init(retries?: number): Promise<boolean>;
   query<T = any>(sql: string, params?: any[], options?: QueryOptions | string): Promise<T>;
@@ -123,6 +128,11 @@ export class Hash {
 }
 
 export class RateLimit {
+  /**
+   * Real client IP behind nginx: X-Real-IP, then the X-Forwarded-For entry added by the
+   * trusted proxy (the first entry is client-controlled and is NOT used).
+   */
+  static getClientIp(request: any, options?: { trustedProxies?: number }): string | null;
   static check(
     request: any,
     options?: {
@@ -130,6 +140,12 @@ export class RateLimit {
       max?: number;
       message?: string;
       statusCode?: number;
+      /** Bucket namespace. Default: `${max}:${windowMs}` (different limiters never share counters). */
+      prefix?: string;
+      /** Max tracked keys (default 50000); oldest are evicted beyond that. */
+      maxKeys?: number;
+      /** Reverse proxies in front of Next.js (default 1 = nginx). */
+      trustedProxies?: number;
       keyGenerator?: (req: any) => string;
     }
   ): {
@@ -144,6 +160,7 @@ export class RateLimit {
     key: string;
     limitPerMinute?: number;
     limitPerDay?: number;
+    maxKeys?: number;
   }): {
     exceeded: boolean;
     type?: "minute" | "day";
@@ -156,6 +173,7 @@ export class RateLimit {
 
 export class IA {
   static cache: { get(key: string): any; set(key: string, value: any): void; has?(key: string): boolean; clear?(): void };
+  static cacheKey(params: { message: string; systemPrompt: string; provider?: string; options?: Record<string, any> }): string;
   static resolveSystemPrompt(userQuestion: string, promptDef?: string | ((q: string) => string | Promise<string>)): Promise<string>;
   static getActiveSystemPrompt(userQuestion: string, fallback?: string | ((q: string) => string | Promise<string>)): Promise<string>;
   static callDeepSeek(systemPrompt: string, userMessage: string, options?: Record<string, any>): Promise<string>;
@@ -164,15 +182,22 @@ export class IA {
   static callGemini(systemPrompt: string, userMessage: string, options?: Record<string, any>): Promise<string>;
   static processChat(params: {
     message: string;
+    /** Request used to derive the client IP (spoof-resistant) when `ip` is not given. */
+    request?: any;
     ip?: string;
     userAgent?: string;
     provider?: "deepseek" | "openai" | "claude" | "gemini";
     systemPrompt?: string | ((q: string) => string | Promise<string>);
     cache?: boolean | { get(k: string): any; set(k: string, v: any): void };
+    /** Override the computed cache key. */
+    cacheKey?: string;
+    /** Reject longer messages with 413 (default 2000 characters). */
+    maxMessageLength?: number;
     rateLimit?: boolean;
     limitPerMinute?: number;
     limitPerDay?: number;
     onLog?: (entry: { question: string; response: string; ip: string; userAgent: string; cached: boolean; durationMs: number; blocked?: boolean }) => Promise<void> | void;
+    /** Provider options: apiKey, model, models, endpoint, timeoutMs (default 30000), max_tokens, temperature, defaultResponse. */
     options?: Record<string, any>;
   } | string): Promise<{ data: { response?: string; error?: string; cached?: boolean; retryAfter?: number }; statusCode: number }>;
   static chat(params: any): Promise<{ data: { response?: string; error?: string; cached?: boolean; retryAfter?: number }; statusCode: number }>;
@@ -187,8 +212,12 @@ export class Validator {
     error: boolean;
     errors: Array<{ field: string; message: string }>;
     message: string[];
+    /** Only the fields declared in the schema (safe to pass to Model.create/update). */
     data: any;
+    /** The full parsed input, including undeclared fields. */
+    raw: any;
   }>;
+  static readInput(input: any): Promise<Record<string, any>>;
   static sanitizeObject(obj: any): any;
 }
 
@@ -218,12 +247,15 @@ export class Upload {
     allowDangerousExtensions?: boolean;
   }): any;
   static url(filename: string, folder?: string): string;
+  /** Serves an uploaded file from a Route Handler (runtime uploads are not served by `next start`). */
+  static serve(relativePath: string | string[], options?: { folder?: string; cacheControl?: string }): Promise<Response>;
 }
 
 export class Seo {
   static registerRoute(routePath: string, languages?: string[]): void;
   static disallow(routes: string | string[]): void;
   static isDisallowed(routePath: string): boolean;
+  static discoverRoutes(appDir?: string): string[];
   static getRoutes(): string[];
   static getDisallowed(): string[];
   static clear(): void;
@@ -244,14 +276,23 @@ export class Seo {
 export class WebSocketManager {
   constructor(options?: {
     port?: number;
+    /** Bind address in standalone mode (default 127.0.0.1, nginx proxies /ws). */
+    host?: string;
     server?: any;
     path?: string;
+    /** Require a valid Auth token (?token=, Bearer header or auth cookie). Applies to both modes. */
     auth?: boolean;
+    cookieKey?: string;
+    secret?: string;
+    /** Allowed Origin headers (or WS_ALLOWED_ORIGINS env, comma separated). */
+    allowedOrigins?: string[] | string;
     maxPayload?: number;
   });
+  onConnection(handler: (ws: any, req: any) => void): void;
   join(room: string, ws: any): void;
   leave(room: string, ws: any): void;
-  broadcast(data: any, room?: string | null): void;
+  /** Sends to everyone, or only to `room` members (a missing room receives nothing). Returns clients reached. */
+  broadcast(data: any, room?: string | null): number;
   close(): void;
 }
 

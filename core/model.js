@@ -11,7 +11,8 @@ async function tryRevalidateTag(tag) {
   try {
     const nextCache = await import("next/cache");
     if (typeof nextCache.revalidateTag === "function") {
-      nextCache.revalidateTag(tag);
+      // Next.js 16 requires a cache-life profile; older versions ignore the 2nd argument.
+      nextCache.revalidateTag(tag, "max");
     }
   } catch {
     // Graceful fallback outside Next.js request context or in CLI
@@ -20,15 +21,27 @@ async function tryRevalidateTag(tag) {
 
 /**
  * Normalizes values before binding them as SQL parameters.
- * Dates are stored as ISO-8601 strings (same format used by timestamps),
- * because SQLite drivers cannot bind Date objects.
+ * Dialect-specific conversion (booleans, Date, JSON) happens in Database.query().
  * @param {any} value
  * @returns {any}
  */
 function normalizeBind(value) {
-  if (value instanceof Date) return value.toISOString();
   if (value === undefined) return null;
   return value;
+}
+
+/**
+ * Parses an integer option (LIMIT/OFFSET) or throws instead of emitting "LIMIT NaN".
+ * @param {any} value
+ * @param {string} name
+ * @returns {number}
+ */
+function toSafeInt(value, name) {
+  const n = Number.parseInt(value, 10);
+  if (!Number.isFinite(n) || n < 0) {
+    throw new Error(`[MODEL ERROR] Invalid ${name} '${value}'. Expected a non-negative integer.`);
+  }
+  return n;
 }
 
 /**
@@ -261,9 +274,9 @@ class Model {
 
     let limitSql = "";
     if (options.limit) {
-      limitSql = `LIMIT ${parseInt(options.limit, 10)}`;
+      limitSql = `LIMIT ${toSafeInt(options.limit, "limit")}`;
       if (options.offset) {
-        limitSql += ` OFFSET ${parseInt(options.offset, 10)}`;
+        limitSql += ` OFFSET ${toSafeInt(options.offset, "offset")}`;
       }
     }
 
@@ -343,7 +356,11 @@ class Model {
     const orderSql = buildOrder(options.order);
 
     const sql = `SELECT * FROM ${this.table} ${whereSql} ${orderSql}`.trim();
-    const result = await this.getDatabase().paginate(sql, params, { page, limit });
+    const result = await this.getDatabase().paginate(sql, params, {
+      page,
+      limit,
+      ...(options.maxLimit !== undefined ? { maxLimit: options.maxLimit } : {}),
+    });
 
     result.data = result.data.map((r) => this.filterHidden(r, options.withHidden));
     return result;
@@ -355,7 +372,7 @@ class Model {
     const placeholders = [];
     const params = [];
 
-    const now = new Date().toISOString();
+    const now = new Date();
 
     for (const [col, def] of Object.entries(this.schema)) {
       const type = String(def.type || "").toLowerCase();
@@ -368,7 +385,7 @@ class Model {
         continue;
       }
 
-      if (col in data) {
+      if (col in data && data[col] !== undefined) {
         let val = data[col];
         if (def.hash && typeof val === "string" && val.length > 0) {
           const isAlreadyHashed = val.startsWith("$scrypt$") || /^\$2[aby]\$\d{2}\$/.test(val);
@@ -422,7 +439,8 @@ class Model {
 
     for (const [col, def] of Object.entries(this.schema)) {
       if (col === this.primaryKey) continue;
-      if (col in data) {
+      // undefined means "not provided" (e.g. optional form field), not NULL.
+      if (col in data && data[col] !== undefined) {
         let val = data[col];
         if (def.hash && typeof val === "string" && val.length > 0) {
           const isAlreadyHashed = val.startsWith("$scrypt$") || /^\$2[aby]\$\d{2}\$/.test(val);
@@ -437,7 +455,7 @@ class Model {
 
     if (this.timestamps && !("updated_at" in data)) {
       sets.push("updated_at = ?");
-      params.push(new Date().toISOString());
+      params.push(new Date());
     }
 
     if (sets.length === 0) return 0;
@@ -465,23 +483,27 @@ class Model {
     }
 
     if (options.cascade && options.cascade.length > 0) {
-      const records = await this.all({ where, withDeleted: true });
-      for (const rec of records) {
-        const id = rec[this.primaryKey];
-        for (const childModel of options.cascade) {
-          if (childModel !== this) {
-            const fk = this.resolveForeignKey(childModel);
-            await childModel.delete({ [fk]: id }, { force: options.force });
+      // All-or-nothing: a failure half-way must not leave orphaned/partially deleted rows.
+      return this.getDatabase().transaction(async () => {
+        const records = await this.all({ where, withDeleted: true });
+        for (const rec of records) {
+          const id = rec[this.primaryKey];
+          for (const childModel of options.cascade) {
+            if (childModel !== this) {
+              const fk = this.resolveForeignKey(childModel);
+              await childModel.delete({ [fk]: id }, { force: options.force });
+            }
           }
         }
-      }
+        return this.delete(where, { force: options.force });
+      });
     }
 
     const { whereClauses, params } = buildWhere(where);
 
     let sql = "";
     if (this.softDelete && !options.force) {
-      const now = new Date().toISOString();
+      const now = new Date();
       sql = `UPDATE ${this.table} SET deleted_at = ? WHERE ${whereClauses.join(" AND ")}`;
       params.unshift(now);
     } else {

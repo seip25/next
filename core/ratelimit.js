@@ -1,21 +1,90 @@
-const memoryBuckets = new Map();
+/**
+ * Buckets live on globalThis so every Next.js module instance (proxy.js bundle,
+ * route handlers, server actions) in the same process shares the same counters.
+ */
+const state = (globalThis.__seip_next_ratelimit ??= { buckets: new Map(), timer: null });
+const memoryBuckets = state.buckets;
 
-setInterval(() => {
-  if (memoryBuckets.size === 0) return;
-  const now = Date.now();
-  for (const [key, bucket] of memoryBuckets) {
-    if (bucket.resetTime <= now) {
-      memoryBuckets.delete(key);
+/** Hard cap on tracked keys so a flood of distinct keys cannot exhaust memory. */
+const DEFAULT_MAX_KEYS = 50000;
+
+if (!state.timer) {
+  state.timer = setInterval(() => {
+    if (memoryBuckets.size === 0) return;
+    const now = Date.now();
+    for (const [key, bucket] of memoryBuckets) {
+      if (bucket.resetTime <= now) {
+        memoryBuckets.delete(key);
+      }
     }
+  }, 60000);
+  state.timer.unref?.();
+}
+
+function getBucket(key, windowMs, now, maxKeys) {
+  let bucket = memoryBuckets.get(key);
+  if (!bucket || bucket.resetTime <= now) {
+    if (!bucket && memoryBuckets.size >= maxKeys) {
+      // Evict the oldest entry (Map keeps insertion order).
+      const oldest = memoryBuckets.keys().next().value;
+      if (oldest !== undefined) memoryBuckets.delete(oldest);
+    }
+    if (bucket) memoryBuckets.delete(key); // re-insert at the end (fresh window)
+    bucket = { count: 1, resetTime: now + windowMs };
+    memoryBuckets.set(key, bucket);
+  } else {
+    bucket.count += 1;
   }
-}, 60000).unref();
+  return bucket;
+}
+
+function isIp(value) {
+  return typeof value === "string" && /^[0-9a-fA-F:.]{2,45}$/.test(value);
+}
 
 /**
  * High-performance Rate Limiter for Next.js 16 proxy.js, Route Handlers, and AI endpoints.
  */
 class RateLimit {
   /**
+   * Resolves the real client IP behind a reverse proxy.
+   *
+   * `X-Forwarded-For` is a list the client can pre-fill: nginx's `$proxy_add_x_forwarded_for`
+   * APPENDS the real address, so the first entry is attacker-controlled. Resolution order:
+   *  1. `X-Real-IP` (set by nginx to `$remote_addr`, overwrites anything the client sent)
+   *  2. the entry of `X-Forwarded-For` added by your `trustedProxies` hops (default: 1 = last entry)
+   *  3. `request.ip`
+   * @param {Request|Object} request
+   * @param {Object} [options={}]
+   * @param {number} [options.trustedProxies=1] Reverse proxies in front of Next.js (nginx = 1).
+   * @returns {string|null}
+   */
+  static getClientIp(request, options = {}) {
+    const trustedProxies = Math.max(1, parseInt(options.trustedProxies ?? process.env.TRUSTED_PROXIES ?? 1, 10) || 1);
+    const headers = request?.headers;
+    const get = (name) => (typeof headers?.get === "function" ? headers.get(name) : headers?.[name]) || null;
+
+    const realIp = String(get("x-real-ip") || "").trim();
+    if (isIp(realIp)) return realIp;
+
+    const forwarded = get("x-forwarded-for");
+    if (forwarded) {
+      const hops = String(forwarded)
+        .split(",")
+        .map((part) => part.trim())
+        .filter(Boolean);
+      const candidate = hops[Math.max(0, hops.length - trustedProxies)];
+      if (isIp(candidate)) return candidate;
+    }
+
+    if (isIp(request?.ip)) return request.ip;
+    return null;
+  }
+
+  /**
    * Evaluates request rate limits.
+   * Buckets are scoped by `prefix` (default derived from max/windowMs), so a strict
+   * login limiter and a general API limiter never share a counter.
    * @param {Request|Object} request
    * @param {Object} [options={}]
    * @returns {{exceeded: boolean, count: number, remaining: number, resetTime: number, response?: Response}}
@@ -25,35 +94,20 @@ class RateLimit {
     const max = options.max ?? 60;
     const message = options.message ?? "Too many requests, please try again later.";
     const statusCode = options.statusCode ?? 429;
+    const prefix = options.prefix ?? `${max}:${windowMs}`;
+    const maxKeys = options.maxKeys ?? DEFAULT_MAX_KEYS;
 
-    let clientIp = null;
+    let clientKey = null;
     if (typeof options.keyGenerator === "function") {
-      clientIp = options.keyGenerator(request);
+      clientKey = options.keyGenerator(request);
     } else {
-      if (typeof request?.headers?.get === "function") {
-        const forwarded = request.headers.get("x-forwarded-for");
-        if (forwarded) {
-          clientIp = forwarded.split(",")[0].trim();
-        } else {
-          clientIp = request.headers.get("x-real-ip");
-        }
-      }
-      if (!clientIp && request?.ip) {
-        clientIp = request.ip;
-      }
+      clientKey = this.getClientIp(request, options);
     }
-    clientIp = clientIp || "127.0.0.1";
+    clientKey = clientKey || "unknown";
 
-    const key = `rl:${clientIp}`;
+    const key = `rl:${prefix}:${clientKey}`;
     const now = Date.now();
-
-    let bucket = memoryBuckets.get(key);
-    if (!bucket || bucket.resetTime <= now) {
-      bucket = { count: 1, resetTime: now + windowMs };
-      memoryBuckets.set(key, bucket);
-    } else {
-      bucket.count += 1;
-    }
+    const bucket = getBucket(key, windowMs, now, maxKeys);
 
     const count = bucket.count;
     const remaining = Math.max(0, max - count);
@@ -95,20 +149,10 @@ class RateLimit {
    * @returns {{exceeded: boolean, type?: "minute"|"day", message?: string, retryAfter?: number}}
    */
   static checkAI(params) {
-    const { key, limitPerMinute = 6, limitPerDay = 30 } = params;
+    const { key, limitPerMinute = 6, limitPerDay = 30, maxKeys = DEFAULT_MAX_KEYS } = params;
     const now = Date.now();
 
-    const minKey = `ai:min:${key}`;
-    const dayKey = `ai:day:${key}`;
-
-    let minBucket = memoryBuckets.get(minKey);
-    if (!minBucket || minBucket.resetTime <= now) {
-      minBucket = { count: 1, resetTime: now + 60000 };
-      memoryBuckets.set(minKey, minBucket);
-    } else {
-      minBucket.count += 1;
-    }
-
+    const minBucket = getBucket(`ai:min:${key}`, 60000, now, maxKeys);
     if (minBucket.count > limitPerMinute) {
       const retryAfter = Math.ceil((minBucket.resetTime - now) / 1000);
       return {
@@ -119,14 +163,7 @@ class RateLimit {
       };
     }
 
-    let dayBucket = memoryBuckets.get(dayKey);
-    if (!dayBucket || dayBucket.resetTime <= now) {
-      dayBucket = { count: 1, resetTime: now + 86400000 };
-      memoryBuckets.set(dayKey, dayBucket);
-    } else {
-      dayBucket.count += 1;
-    }
-
+    const dayBucket = getBucket(`ai:day:${key}`, 86400000, now, maxKeys);
     if (dayBucket.count > limitPerDay) {
       const retryAfter = Math.ceil((dayBucket.resetTime - now) / 1000);
       return {

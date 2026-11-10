@@ -15,6 +15,17 @@ export function makeSeo() {
 
   const props = Config.props();
   const baseUrl = props.appUrl || "http://localhost:3000";
+  if (!process.env.APP_URL) {
+    console.log(colors.yellow("[WARN] APP_URL is not set: sitemap.xml will use " + baseUrl + ". Set APP_URL=https://tudominio.com in .env."));
+  }
+
+  // The CLI never runs your app code, so discover static routes from app/ (or src/app/).
+  const discovered = Seo.discoverRoutes();
+  for (const route of discovered) Seo.registerRoute(route);
+  const included = Seo.getRoutes();
+  console.log(
+    colors.cyan(`[INFO] ${discovered.length} route(s) found in the App Router, ${included.length} included in sitemap.xml (protected routes excluded).`)
+  );
 
   // 1. Generate public/robots.txt
   const robotsContent = Seo.generateRobots(baseUrl);

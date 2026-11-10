@@ -40,6 +40,19 @@ const MIME_EXTENSIONS = {
   "video/quicktime": ".mov",
 };
 
+/** Reverse map used when serving files. */
+const EXTENSION_MIME = Object.fromEntries(
+  Object.entries(MIME_EXTENSIONS)
+    .filter(([mime]) => mime !== "image/jpg")
+    .map(([mime, ext]) => [ext, mime])
+);
+
+/** Types safe to render inline; everything else is served as a download. */
+const INLINE_TYPES = new Set([
+  "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp",
+  "application/pdf", "audio/mpeg", "audio/wav", "audio/ogg", "video/mp4", "video/webm", "video/quicktime",
+]);
+
 /** Extensions that must never be written into a public/static directory. */
 const BLOCKED_EXTENSIONS = new Set([
   ".html", ".htm", ".xhtml", ".shtml", ".svg", ".svgz", ".xml", ".xsl", ".xslt",
@@ -132,6 +145,11 @@ class Upload {
   /**
    * Saves a File/Blob uploaded via Next.js FormData in Server Actions or Route Handlers.
    * Zero-dependency native stream saving.
+   *
+   * Note: Server Actions reject bodies over 1MB by default before this code runs.
+   * Raise `experimental.serverActions.bodySizeLimit` in next.config.js (e.g. "10mb")
+   * or upload through a Route Handler. Runtime uploads under public/ are not served by
+   * `next start`: use nginx (nginx:conf) or `Upload.serve()` in a Route Handler.
    * @param {File|Blob} file
    * @param {Object} [options={}]
    * @param {string} [options.folder="uploads"]
@@ -248,6 +266,84 @@ class Upload {
         cb(null, true);
       },
     });
+  }
+
+  /**
+   * Serves a previously uploaded file from a Route Handler.
+   *
+   * `next start` only serves files that existed in public/ at BUILD time, so files
+   * uploaded at runtime return 404 unless nginx serves them. Add a catch-all route
+   * with the same URL prefix as the folder:
+   *
+   *   // app/uploads/[...path]/route.js
+   *   import { Upload } from "@seip/nextjs/upload";
+   *   export async function GET(req, { params }) {
+   *     return Upload.serve((await params).path, { folder: "uploads" });
+   *   }
+   *
+   * @param {string|string[]} relativePath - Path segments after the folder.
+   * @param {Object} [options={}]
+   * @param {string} [options.folder="uploads"]
+   * @param {string} [options.cacheControl="public, max-age=86400"]
+   * @returns {Promise<Response>}
+   */
+  static async serve(relativePath, options = {}) {
+    const { folder = "uploads", cacheControl = "public, max-age=86400" } = options;
+    const notFound = () => new Response("Not Found", { status: 404, headers: { "Content-Type": "text/plain" } });
+
+    const segments = (Array.isArray(relativePath) ? relativePath : String(relativePath || "").split("/"))
+      .map((segment) => String(segment))
+      .filter((segment) => segment.length > 0);
+    if (segments.length === 0) return notFound();
+    for (const segment of segments) {
+      if (segment === "." || segment === ".." || /[\\/\0]/.test(segment) || segment.startsWith(".")) {
+        return notFound();
+      }
+    }
+
+    let baseDir;
+    try {
+      const safe = safeFolder(folder);
+      const isDesktop = Config.isDesktop();
+      const root = isDesktop ? Config.userDataDir() : path.resolve(Config.appDir(), "public");
+      const relativeDir = isDesktop
+        ? (safe === "uploads" || safe.startsWith("uploads/") ? safe : `uploads/${safe}`)
+        : safe;
+      baseDir = resolveSafeDestination(root, relativeDir);
+    } catch {
+      return notFound();
+    }
+
+    let filePath;
+    try {
+      filePath = resolveSafeDestination(baseDir, segments.join("/"));
+    } catch {
+      return notFound();
+    }
+
+    let stat;
+    try {
+      stat = await fs.promises.stat(filePath);
+    } catch {
+      return notFound();
+    }
+    if (!stat.isFile()) return notFound();
+
+    const ext = path.extname(filePath).toLowerCase();
+    const mimeType = EXTENSION_MIME[ext] || "application/octet-stream";
+    const headers = {
+      "Content-Type": mimeType,
+      "Content-Length": String(stat.size),
+      "Cache-Control": cacheControl,
+      "X-Content-Type-Options": "nosniff",
+      "Content-Security-Policy": "default-src 'none'; sandbox",
+      "Content-Disposition": INLINE_TYPES.has(mimeType)
+        ? "inline"
+        : `attachment; filename="${path.basename(filePath).replace(/"/g, "")}"`,
+    };
+
+    const stream = Readable.toWeb(fs.createReadStream(filePath));
+    return new Response(stream, { status: 200, headers });
   }
 
   static url(filename, folder = "uploads") {

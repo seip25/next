@@ -81,29 +81,80 @@ function uniquePath(dir, baseName) {
   return path.join(dir, `${stem}_${n}${ext}`);
 }
 
+/**
+ * Splits a SQL script into statements on top-level semicolons. Semicolons inside
+ * quotes, line comments (--), block comments and Postgres dollar-quoted bodies
+ * ($$ ... $$, $fn$ ... $fn$ — functions / triggers) do not split. Comments are dropped.
+ * @param {string} sqlText
+ * @returns {string[]}
+ */
 export function splitSqlStatements(sqlText) {
   const statements = [];
   let current = "";
   let inSingleQuote = false;
   let inDoubleQuote = false;
-  let inComment = false;
+  let inBacktick = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+  let dollarTag = null;
 
   for (let i = 0; i < sqlText.length; i++) {
     const char = sqlText[i];
     const nextChar = sqlText[i + 1];
 
-    if (inComment) {
-      if (char === "\n" || char === "\r") inComment = false;
+    if (inLineComment) {
+      if (char === "\n" || char === "\r") {
+        inLineComment = false;
+        current += char;
+      }
       continue;
     }
 
-    if (!inSingleQuote && !inDoubleQuote && char === "-" && nextChar === "-") {
-      inComment = true;
+    if (inBlockComment) {
+      if (char === "*" && nextChar === "/") {
+        inBlockComment = false;
+        i++;
+        current += " ";
+      }
+      continue;
+    }
+
+    if (dollarTag) {
+      if (char === "$" && sqlText.startsWith(dollarTag, i)) {
+        current += dollarTag;
+        i += dollarTag.length - 1;
+        dollarTag = null;
+        continue;
+      }
+      current += char;
+      continue;
+    }
+
+    const inQuote = inSingleQuote || inDoubleQuote || inBacktick;
+
+    if (!inQuote && char === "-" && nextChar === "-") {
+      inLineComment = true;
       i++;
       continue;
     }
 
-    if (char === "'" && !inDoubleQuote) {
+    if (!inQuote && char === "/" && nextChar === "*") {
+      inBlockComment = true;
+      i++;
+      continue;
+    }
+
+    if (!inQuote && char === "$") {
+      const match = /^\$[A-Za-z_][A-Za-z0-9_]*\$|^\$\$/.exec(sqlText.slice(i));
+      if (match) {
+        dollarTag = match[0];
+        current += dollarTag;
+        i += dollarTag.length - 1;
+        continue;
+      }
+    }
+
+    if (char === "'" && !inDoubleQuote && !inBacktick) {
       if (inSingleQuote && nextChar === "'") {
         current += "''";
         i++;
@@ -114,7 +165,7 @@ export function splitSqlStatements(sqlText) {
       continue;
     }
 
-    if (char === '"' && !inSingleQuote) {
+    if (char === '"' && !inSingleQuote && !inBacktick) {
       if (inDoubleQuote && nextChar === '"') {
         current += '""';
         i++;
@@ -125,7 +176,13 @@ export function splitSqlStatements(sqlText) {
       continue;
     }
 
-    if (char === ";" && !inSingleQuote && !inDoubleQuote) {
+    if (char === "`" && !inSingleQuote && !inDoubleQuote) {
+      inBacktick = !inBacktick;
+      current += char;
+      continue;
+    }
+
+    if (char === ";" && !inQuote) {
       const trimmed = current.trim();
       if (trimmed.length > 0) statements.push(trimmed);
       current = "";
@@ -138,6 +195,56 @@ export function splitSqlStatements(sqlText) {
   const trimmed = current.trim();
   if (trimmed.length > 0) statements.push(trimmed);
   return statements;
+}
+
+/**
+ * Splits a migration file into its Up / Down sections. The marker must be a line of its
+ * own ("-- Down"), so comments such as "-- downloads counter" no longer cut the file.
+ * @param {string} content
+ * @returns {{up: string, down: string|null}}
+ */
+export function splitMigrationSections(content) {
+  const marker = /^[ \t]*--[ \t]*Down[ \t]*:?[ \t]*$/im;
+  const match = marker.exec(content);
+  if (!match) return { up: content, down: null };
+  return {
+    up: content.slice(0, match.index),
+    down: content.slice(match.index + match[0].length),
+  };
+}
+
+/**
+ * Orders CREATE TABLE statements so referenced tables are created first
+ * (Postgres/MySQL reject a FOREIGN KEY to a table that does not exist yet).
+ * @param {Array<{ModelClass: any, ddl: string}>} missingTables
+ * @returns {Array<{ModelClass: any, ddl: string}>}
+ */
+export function sortTablesByDependencies(missingTables) {
+  const byTable = new Map(missingTables.map((entry) => [entry.ModelClass.table, entry]));
+  const deps = (entry) => {
+    const out = new Set();
+    for (const def of Object.values(entry.ModelClass.schema || {})) {
+      if (!def || !def.references) continue;
+      const ref = typeof def.references === "string" ? def.references.split(".")[0] : def.references.table;
+      if (ref && ref !== entry.ModelClass.table && byTable.has(ref)) out.add(ref);
+    }
+    return out;
+  };
+
+  const sorted = [];
+  const state = new Map(); // table -> "visiting" | "done"
+  const visit = (table) => {
+    const status = state.get(table);
+    if (status === "done") return;
+    if (status === "visiting") return; // cycle: keep declared order, FK added as-is
+    state.set(table, "visiting");
+    const entry = byTable.get(table);
+    for (const dep of deps(entry)) visit(dep);
+    state.set(table, "done");
+    sorted.push(entry);
+  };
+  for (const entry of missingTables) visit(entry.ModelClass.table);
+  return sorted;
 }
 
 export async function inspectDatabaseSchema(db, tableName) {
@@ -312,7 +419,7 @@ export async function makeMigration(name, modelName = null, autoRun = false) {
     const downBlocks = [];
 
     console.log(colors.cyan("\n[INFO] Detected database schema changes:"));
-    for (const { ModelClass, ddl } of missingTables) {
+    for (const { ModelClass, ddl } of sortTablesByDependencies(missingTables)) {
       console.log(colors.green(`  + CREATE TABLE: ${ModelClass.table}`));
       upBlocks.push(ddl);
       downBlocks.unshift(`DROP TABLE IF EXISTS ${ModelClass.table};`);
@@ -396,7 +503,7 @@ export async function runMigrations(exitOnFinish = true) {
     try {
       if (file.endsWith(".sql")) {
         const fullContent = fs.readFileSync(filePath, "utf-8");
-        const upSection = fullContent.split(/--\s*Down/i)[0] || fullContent;
+        const { up: upSection } = splitMigrationSections(fullContent);
         const statements = splitSqlStatements(upSection);
 
         await db.transaction(async (tx) => {
@@ -468,11 +575,11 @@ export async function rollbackMigrations() {
 
       if (file.endsWith(".sql")) {
         const content = fs.readFileSync(filePath, "utf-8");
-        const downParts = content.split(/--\s*Down/i);
-        if (downParts.length <= 1) {
+        const { down } = splitMigrationSections(content);
+        if (down === null) {
           throw new Error("Migration has no '-- Down' section; refusing to mark it rolled back.");
         }
-        const downStatements = splitSqlStatements(downParts[1]);
+        const downStatements = splitSqlStatements(down);
         await db.transaction(async (tx) => {
           for (const stmt of downStatements) {
             await tx.query(stmt);

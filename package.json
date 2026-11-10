@@ -61,7 +61,10 @@
     "./colors": {
       "default": "./core/util/colors.js"
     },
-    "./*": "./*"
+    "./*": "./*",
+    "./env": {
+      "default": "./core/util/env.js"
+    }
   },
   "bin": {
     "seip-nextjs": "./bin/cli.js",
@@ -109,14 +112,32 @@
     "LICENSE"
   ],
   "dependencies": {},
-  "optionalDependencies": {
+  "peerDependencies": {
     "better-sqlite3": "^11.8.1",
     "bcrypt": "^5.1.1",
     "multer": "^2.0.2",
     "mysql2": "^3.12.0",
     "pg": "^8.13.3",
-    "redis": "^6.1.0",
-    "ws": "^8.18.0",
-    "openai": "^4.86.1"
+    "ws": "^8.18.0"
+  },
+  "peerDependenciesMeta": {
+    "better-sqlite3": {
+      "optional": true
+    },
+    "bcrypt": {
+      "optional": true
+    },
+    "multer": {
+      "optional": true
+    },
+    "mysql2": {
+      "optional": true
+    },
+    "pg": {
+      "optional": true
+    },
+    "ws": {
+      "optional": true
+    }
   }
 }

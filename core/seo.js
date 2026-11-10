@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import Config from "./config.js";
 
 const DEFAULT_DISALLOWED_PREFIXES = [
@@ -13,8 +15,24 @@ const DEFAULT_DISALLOWED_PREFIXES = [
   "/settings",
 ];
 
-const registeredSeoRoutes = new Set();
-const customDisallowedRoutes = new Set(DEFAULT_DISALLOWED_PREFIXES);
+// Shared across Next.js module instances (app/sitemap.js may live in a different bundle).
+const seoState = (globalThis.__seip_next_seo ??= {
+  routes: new Set(),
+  disallowed: new Set(DEFAULT_DISALLOWED_PREFIXES),
+});
+const registeredSeoRoutes = seoState.routes;
+const customDisallowedRoutes = seoState.disallowed;
+
+function escapeXml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+const PAGE_FILE = /^page\.(js|jsx|ts|tsx|mdx|md)$/;
 
 /**
  * Intelligent SEO module for Next.js with automatic protection against indexing
@@ -80,6 +98,48 @@ class Seo {
     return false;
   }
 
+  /**
+   * Discovers static routes from the App Router directory (app/ or src/app/):
+   * every folder containing page.(js|jsx|ts|tsx|mdx). Route groups "(group)" are
+   * flattened; dynamic "[param]", parallel "@slot", private "_folder" and
+   * intercepting "(.)" segments are skipped (they cannot be listed statically).
+   * @param {string} [appDir] - Defaults to <cwd>/app or <cwd>/src/app.
+   * @returns {string[]} Discovered routes (before the disallow filter).
+   */
+  static discoverRoutes(appDir) {
+    const cwd = process.cwd();
+    const root =
+      appDir ||
+      [path.join(cwd, "app"), path.join(cwd, "src", "app")].find((dir) => fs.existsSync(dir));
+    if (!root || !fs.existsSync(root)) return [];
+
+    const found = new Set();
+    const walk = (dir, segments) => {
+      let entries;
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      if (entries.some((e) => e.isFile() && PAGE_FILE.test(e.name))) {
+        found.add(`/${segments.join("/")}`);
+      }
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const name = entry.name;
+        if (name.startsWith("_") || name.startsWith("@") || name.startsWith("[") || name === "node_modules") continue;
+        if (name.startsWith("(")) {
+          if (name.startsWith("(.")) continue; // intercepting route
+          walk(path.join(dir, name), segments); // route group: no URL segment
+          continue;
+        }
+        walk(path.join(dir, name), [...segments, name]);
+      }
+    };
+    walk(root, []);
+    return Array.from(found).sort();
+  }
+
   static getRoutes() {
     return Array.from(registeredSeoRoutes);
   }
@@ -110,7 +170,7 @@ class Seo {
         const priority = routePath === "/" ? "1.0" : "0.8";
         return [
           "  <url>",
-          `    <loc>${rootUrl}${routePath}</loc>`,
+          `    <loc>${escapeXml(`${rootUrl}${routePath}`)}</loc>`,
           `    <lastmod>${lastmod}</lastmod>`,
           "    <changefreq>weekly</changefreq>",
           `    <priority>${priority}</priority>`,
@@ -135,8 +195,10 @@ class Seo {
     const props = Config.props();
     const rootUrl = (baseUrl || props.appUrl || `${props.host}:${props.port}`).replace(/\/$/, "");
 
+    // Robots rules are prefix matches: "Disallow: /login" blocks /login and /login/...,
+    // while "Disallow: /login/" would leave /login itself crawlable.
     const disallowRules = Array.from(customDisallowedRoutes)
-      .map((r) => `Disallow: ${r.endsWith("/") ? r : `${r}/`}`)
+      .map((r) => `Disallow: ${r.replace(/\/+$/, "") || "/"}`)
       .join("\n");
 
     return [
@@ -180,7 +242,7 @@ class Seo {
     const props = Config.props();
     const rootUrl = (baseUrl || props.appUrl || `${props.host}:${props.port}`).replace(/\/$/, "");
 
-    const disallow = Array.from(customDisallowedRoutes).map((r) => (r.endsWith("/") ? r : `${r}/`));
+    const disallow = Array.from(customDisallowedRoutes).map((r) => r.replace(/\/+$/, "") || "/");
 
     return {
       rules: {

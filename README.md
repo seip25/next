@@ -32,13 +32,20 @@
 npm install @seip/nextjs
 ```
 
-*Opcionales según tu base de datos o necesidades:*
+*Opcionales según tu base de datos o necesidades* (son `peerDependencies` opcionales:
+no se instalan solos, instala solo lo que uses):
 ```bash
 npm install better-sqlite3 # Si usas SQLite en Node < 22.18
 npm install pg             # Si usas PostgreSQL
 npm install mysql2         # Si usas MySQL / MariaDB
 npm install ws             # Si usas el servidor WebSocket independiente
+npm install multer         # Si usas Upload.disk() / Upload.storage()
+npm install bcrypt         # Solo si necesitas verificar hashes bcrypt existentes
 ```
+
+> **Tip:** importa por subruta (`@seip/nextjs/auth`, `@seip/nextjs/ratelimit`,
+> `@seip/nextjs/database`…) en `proxy.js`: así no se cargan módulos que no usas.
+> Los drivers de base de datos se cargan de forma diferida en la primera consulta.
 
 ---
 
@@ -75,10 +82,24 @@ export async function register(formData) {
   const result = await validator.validate(formData);
   if (!result.success) return { errors: result.errors };
 
-  // El password se hashea automáticamente con scrypt
+  // result.data solo contiene campos del schema (un campo "role" inyectado se descarta;
+  // el input completo queda en result.raw). El password se hashea automáticamente con scrypt.
   const userId = await User.create(result.data);
   return { success: true, userId };
 }
+```
+
+**Transacciones:** dentro del callback, tanto `tx.query()` como `db.query()` corren en la
+transacción (misma conexión). En SQLite, las consultas de otras requests esperan a que la
+transacción termine en vez de quedar incluidas en ella. Las llamadas anidadas usan `SAVEPOINT`.
+
+```javascript
+import { db } from "@seip/nextjs/database";
+
+await db.transaction(async (tx) => {
+  const orderId = await tx.query("INSERT INTO orders (user_id) VALUES (?)", [userId]);
+  await tx.query("UPDATE stock SET qty = qty - 1 WHERE product_id = ?", [productId]);
+});
 ```
 
 ---
@@ -91,10 +112,11 @@ export async function register(formData) {
 
 ```javascript
 // proxy.js (o middleware.js)
-import { Auth, RateLimit } from "@seip/nextjs";
+import { Auth } from "@seip/nextjs/auth";
+import { RateLimit } from "@seip/nextjs/ratelimit";
 
 export async function proxy(request) {
-  // 1. Rate Limit
+  // 1. Rate Limit (IP real vía X-Real-IP de nginx; X-Forwarded-For del cliente no se usa)
   const rl = RateLimit.check(request, { max: 100, windowMs: 60000 });
   if (rl.exceeded) return rl.response;
 
@@ -108,6 +130,14 @@ export async function proxy(request) {
 }
 ```
 
+- El token se lee de la cookie `auth` o de `Authorization: Bearer <token>` (clientes de API).
+- `Auth.logout()` revoca la sesión en el servidor. La lista de sesiones revocadas se comparte
+  entre `proxy.js` y las rutas, y en producción se guarda en
+  `database/.revoked-sessions.json` para sobrevivir a `pm2 restart`
+  (`AUTH_REVOCATION_FILE=<ruta>` para cambiarla, `AUTH_REVOCATION_FILE=false` para solo memoria).
+- Limitadores distintos no comparten contador; usa `prefix` para nombrarlos:
+  `RateLimit.check(request, { max: 5, windowMs: 60000, prefix: "login" })`.
+
 ---
 
 ### 3. Asistente de IA con Anti-Fuga de Tokens (`IA`)
@@ -118,12 +148,11 @@ import { IA } from "@seip/nextjs";
 
 export async function POST(req) {
   const { message } = await req.json();
-  const ip = req.headers.get("x-forwarded-for") || "127.0.0.1";
 
   // Caching y Rate Limiting en memoria por defecto (cero ataduras a base de datos)
   const result = await IA.processChat({
     message,
-    ip,
+    request: req, // la IP se obtiene de forma segura (RateLimit.getClientIp)
     provider: "deepseek", // o "openai", "claude", "gemini"
     systemPrompt: "Eres un asistente experto y servicial.",
     limitPerMinute: 6,
@@ -137,6 +166,12 @@ export async function POST(req) {
   return Response.json(result.data, { status: result.statusCode });
 }
 ```
+
+- El mensaje del usuario va solo como mensaje `user`, nunca dentro del system prompt.
+- La caché distingue proveedor, modelo y system prompt (`IA.cacheKey()`), y los mensajes de
+  más de `maxMessageLength` (2000 por defecto) se rechazan con 413.
+- Cada llamada tiene timeout (`options.timeoutMs`, 30s por defecto). Modelos por defecto
+  configurables con `DEEPSEEK_MODEL`, `OPENAI_MODEL`, `ANTHROPIC_MODEL`, `GEMINI_MODEL`.
 
 ---
 
@@ -164,6 +199,22 @@ export async function POST(req) {
   return Response.json({ url: uploaded.url, filename: uploaded.filename });
 }
 ```
+
+> **Importante:** `next start` solo sirve los archivos que había en `public/` al momento
+> del build, así que lo subido en runtime da 404 si nadie más lo sirve. La config de
+> `nginx:conf` ya lo sirve desde `public/`. Sin nginx, agrega esta ruta:
+>
+> ```javascript
+> // app/uploads/[...path]/route.js
+> import { Upload } from "@seip/nextjs/upload";
+> export async function GET(req, { params }) {
+>   return Upload.serve((await params).path, { folder: "uploads" });
+> }
+> ```
+>
+> Los Server Actions rechazan bodies de más de 1MB por defecto: sube
+> `experimental.serverActions.bodySizeLimit` en `next.config.js` (por ejemplo `"10mb"`)
+> o usa un Route Handler como el de arriba.
 
 ---
 
@@ -194,7 +245,33 @@ export default function robots() {
 
 ---
 
+### 6. WebSocket (worker de PM2)
+
+```javascript
+// server/ws.js  (make:ecosystem lo detecta y crea la app "<nombre>-ws")
+import { WebSocketManager } from "@seip/nextjs/ws";
+
+const wsm = new WebSocketManager({
+  port: Number(process.env.WS_PORT) || 3001, // escucha en 127.0.0.1; nginx publica /ws
+  auth: true,                                // token en ?token=, Bearer o cookie "auth"
+  allowedOrigins: ["https://midominio.com"],
+});
+
+wsm.onConnection((ws) => {
+  ws.join(`user:${ws.user.id}`);
+});
+
+// Solo llega a los miembros de la sala (si no hay nadie conectado, no se envía a nadie)
+wsm.broadcast({ type: "notification" }, "user:42");
+```
+
+---
+
 ## 💻 Comandos del CLI (`npx @seip/nextjs`)
+
+El CLI carga `.env`, `.env.local`, `.env.$NODE_ENV` y `.env.$NODE_ENV.local` con la misma
+prioridad que Next.js (las variables ya definidas en el entorno ganan), así que `migrate`
+usa la misma base de datos que tu app.
 
 ```bash
 # Modelos y Migraciones
@@ -211,16 +288,24 @@ npx @seip/nextjs seed --force           # Re-ejecuta todos los seeds
 
 # SEO y WebSocket
 npx @seip/nextjs make:seo               # Genera public/sitemap.xml y robots.txt
-npx @seip/nextjs ws:start --port 3001   # Servidor WebSocket independiente
+npx @seip/nextjs ws:start 3001 --auth   # Servidor WebSocket independiente (--auth exige token)
 
 # Despliegue en VPS
 npx @seip/nextjs make:ecosystem         # Genera ecosystem.config.cjs para PM2
 npx @seip/nextjs make:ecosystem --start # Genera y arranca con PM2 (exit code != 0 si falla)
-npx @seip/nextjs nginx:conf midominio.com 3000 /var/www/proyecto # Configura Nginx y Certbot
+npx @seip/nextjs nginx:conf midominio.com 3000 /var/www/proyecto # Config HTTP + pasos de Certbot
+npx @seip/nextjs nginx:conf midominio.com --ssl  # Config HTTPS final (con el certificado ya emitido)
+                                                 # --www / --no-www / --with-ws
 
 # Aplicación de Escritorio (Desktop)
 npx @seip/nextjs make:desktop           # Genera scaffold de Nextron / Electron
 ```
+
+**Despliegue con PM2 (1 instancia):** `ecosystem.config.cjs` lee `.env` cuando PM2 lo carga
+(no copia secretos al archivo; tras editar `.env` usa `pm2 reload ecosystem.config.cjs --update-env`).
+Next.js escucha en `127.0.0.1` (solo nginx es público). Con `output: "standalone"` se define
+`APP_DIR` con la raíz del proyecto, así la base SQLite, los uploads y las sesiones revocadas
+no quedan dentro de `.next/standalone` (que se borra en cada build).
 
 **Migraciones JS:** además de `.sql`, el runner ejecuta `.js`/`.mjs` que exporten
 `async up(tx)` (y opcionalmente `down(tx)`), ejecutadas dentro de la misma transacción
