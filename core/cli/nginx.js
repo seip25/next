@@ -5,8 +5,8 @@ import { parseEnv } from "./ecosystem.js";
 
 /**
  * Generates production-ready Nginx reverse proxy configuration for Next.js on VPS.
- * Matches real-world production configurations with keepalive upstream,
- * public asset caching, 100M upload limits, Gzip compression, and Certbot SSL.
+ * Keepalive upstream, public asset caching, 100M upload limits, Gzip, optional
+ * WebSocket worker proxy and a Certbot-friendly flow (HTTP first, --ssl for the final config).
  */
 export function generateNginxConfig() {
   const cwd = process.cwd();
@@ -50,41 +50,53 @@ export function generateNginxConfig() {
   const publicRoot = `${projectRoot}/public`;
 
   const upstreamName = `nextjs_${domain.replace(/[^a-zA-Z0-9_]/g, "_")}`;
+  // Per-site variable name: two site files defining the same map variable make nginx fail.
+  const connVar = `${upstreamName}_connection`;
 
-  const nginxConf = `# =============================================================
-# Next.js Nginx Reverse Proxy Configuration
-# File: /etc/nginx/sites-available/${domain}
-# =============================================================
+  // www.<domain> only for apex domains (example.com), unless forced with --www / --no-www.
+  const includeWww = rawArgs.includes("--no-www")
+    ? false
+    : rawArgs.includes("--www") || (!domain.startsWith("www.") && domain.split(".").length === 2);
+  const serverNames = includeWww ? `${domain} www.${domain}` : domain;
+  const certbotDomains = includeWww ? `-d ${domain} -d www.${domain}` : `-d ${domain}`;
 
-upstream ${upstreamName} {
-    server 127.0.0.1:${port};
-    keepalive 64;
-}
+  const wsCandidates = ["server/ws.js", "ws.js", "server/websocket.js"];
+  const withWs =
+    rawArgs.includes("--with-ws") ||
+    Boolean(env.WS_PORT) ||
+    wsCandidates.some((f) => fs.existsSync(path.join(cwd, f)));
+  const wsPort = parseInt(env.WS_PORT || "3001", 10);
+  const wsPath = env.WS_PATH || "/ws";
 
-# HTTP - Redirect all traffic to HTTPS
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${domain} www.${domain};
-    return 301 https://$host$request_uri;
-}
+  // --ssl prints the final HTTPS config (only once the Let's Encrypt certificate exists).
+  // By default an HTTP-only config is generated: `nginx -t` passes before the certificate
+  // exists, and `certbot --nginx` adds the 443 server + redirect itself.
+  const withSsl = rawArgs.includes("--ssl");
 
-# HTTPS - Next.js Reverse Proxy
-server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    server_name ${domain} www.${domain};
+  const proxyHeaders = [
+    "        proxy_http_version 1.1;",
+    "        proxy_set_header Upgrade $http_upgrade;",
+    `        proxy_set_header Connection $${connVar};`,
+    "        proxy_set_header Host $host;",
+    "        proxy_set_header X-Real-IP $remote_addr;",
+    "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+    "        proxy_set_header X-Forwarded-Proto $scheme;",
+    "        proxy_cache_bypass $http_upgrade;",
+  ].join("\n");
 
-    # SSL Certificates (Managed by Certbot or manual certificates)
-    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+  const wsLocation = withWs
+    ? `
+    # Standalone WebSocket worker (PM2 app "<name>-ws")
+    location ${wsPath} {
+        proxy_pass http://${upstreamName}_ws;
+${proxyHeaders}
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+`
+    : "";
 
-    # Project public directory for direct asset serving
-    root ${publicRoot};
-
-    # Maximum file upload limit (100MB)
+  const locations = `    # Maximum file upload limit (100MB)
     client_max_body_size 100M;
 
     # Gzip Compression
@@ -112,14 +124,30 @@ server {
         log_not_found off;
     }
 
-    # Static Assets in public/ & Next.js compiled static files
-    location ~* \\.(?:css|js|jpg|jpeg|gif|png|ico|cur|gz|svg|svgz|mp4|ogg|ogv|webm|htc|woff|woff2|ttf|eot)$ {
-        expires 1M;
-        access_log off;
-        add_header Cache-Control "public, max-age=2592000, immutable";
+    # Project public directory for direct asset serving (includes runtime uploads)
+    root ${publicRoot};
+
+    # User uploads: never sniffed / executed as HTML or script
+    location ^~ /uploads/ {
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Content-Security-Policy "default-src 'none'; sandbox" always;
+        expires 7d;
         try_files $uri @proxy;
     }
 
+    # Next.js build assets are content-hashed: Next.js already sends immutable headers
+    location ^~ /_next/static/ {
+        proxy_pass http://${upstreamName};
+${proxyHeaders}
+    }
+
+    # Files in public/ are NOT hashed: cache them, but never as "immutable"
+    location ~* \\.(?:css|js|jpg|jpeg|gif|png|webp|avif|ico|cur|svg|svgz|mp4|ogg|ogv|webm|woff|woff2|ttf|eot)$ {
+        expires 7d;
+        access_log off;
+        try_files $uri @proxy;
+    }
+${wsLocation}
     location / {
         try_files $uri @proxy;
     }
@@ -127,17 +155,71 @@ server {
     # Reverse proxy to Next.js Upstream with WebSocket & Streaming support
     location @proxy {
         proxy_pass http://${upstreamName};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_cache_bypass $http_upgrade;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+${proxyHeaders}
         proxy_buffering off;
         client_body_buffer_size 128k;
-    }
+    }`;
+
+  const wsUpstream = withWs
+    ? `
+upstream ${upstreamName}_ws {
+    server 127.0.0.1:${wsPort};
+}
+`
+    : "";
+
+  const header = `# =============================================================
+# Next.js Nginx Reverse Proxy Configuration
+# File: /etc/nginx/sites-available/${domain}
+# =============================================================
+
+# "Connection: upgrade" only for WebSocket requests; empty otherwise so the
+# upstream keepalive pool is actually reused for normal requests.
+map $http_upgrade $${connVar} {
+    default upgrade;
+    ''      '';
+}
+
+upstream ${upstreamName} {
+    server 127.0.0.1:${port};
+    keepalive 64;
+}
+${wsUpstream}`;
+
+  const nginxConf = withSsl
+    ? `${header}
+# HTTP - Redirect all traffic to HTTPS
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${serverNames};
+    return 301 https://$host$request_uri;
+}
+
+# HTTPS - Next.js Reverse Proxy
+server {
+    # "listen ... http2" works on every nginx version ("http2 on;" needs nginx >= 1.25.1).
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${serverNames};
+
+    # SSL Certificates (created by Certbot)
+    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+${locations}
+}
+`
+    : `${header}
+# HTTP server. Certbot (step 4) adds the HTTPS server and the HTTP -> HTTPS redirect.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${serverNames};
+
+${locations}
 }
 `;
 
@@ -156,8 +238,13 @@ server {
   console.log(colors.green("   sudo nginx -t"));
   console.log(colors.green("   sudo systemctl reload nginx\n"));
 
-  console.log(colors.yellow("4. Genera el certificado SSL gratis con Certbot:"));
-  console.log(colors.green(`   sudo certbot --nginx -d ${domain} -d www.${domain}\n`));
+  if (withSsl) {
+    console.log(colors.yellow("4. Configuración HTTPS final (requiere el certificado ya emitido). Verifica y recarga:"));
+    console.log(colors.green("   sudo nginx -t && sudo systemctl reload nginx\n"));
+  } else {
+    console.log(colors.yellow("4. Genera el certificado SSL gratis con Certbot (agrega HTTPS y la redirección):"));
+    console.log(colors.green(`   sudo certbot --nginx ${certbotDomains}\n`));
+  }
   console.log(colors.bold.cyan("============================================================="));
 }
 

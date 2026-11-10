@@ -48,41 +48,112 @@ if (!DB_TYPE) {
   DB_TYPE = "sqlite";
 }
 
-/** Tracks transaction nesting per async context (avoids cross-request false nesting). */
+/**
+ * Tracks the active transaction per async context. The store records which
+ * Database owns it (and the dedicated client for Postgres/MySQL), so queries
+ * issued inside a transaction callback run on the transaction's connection.
+ */
 const txContext = new AsyncLocalStorage();
 
+/**
+ * Drivers are loaded lazily (on first init) and memoized process-wide, so importing
+ * this module (e.g. from proxy.js) does not load pg/mysql2/sqlite until needed.
+ */
+const driverCache = (globalThis.__seip_next_db_drivers ??= new Map());
 
-let mysqlPromise = null;
-let pgPromise = null;
-let sqlitePromise = null;
-
-if (DB_TYPE === "postgres") {
-  try {
-    pgPromise = await import("pg");
-  } catch {
-    console.error("[DATABASE ERROR] 'pg' package is not installed. Run 'npm install pg'.");
-  }
-} else if (DB_TYPE === "mysql") {
-  try {
-    mysqlPromise = await import("mysql2/promise");
-  } catch {
-    console.error("[DATABASE ERROR] 'mysql2' package is not installed. Run 'npm install mysql2'.");
-  }
-} else if (DB_TYPE === "sqlite") {
+async function loadSqliteDriver() {
   try {
     const { DatabaseSync } = await import("node:sqlite");
     const testDb = new DatabaseSync(":memory:");
     testDb.close();
-    sqlitePromise = { source: "node:sqlite", DatabaseSync };
+    return { source: "node:sqlite", DatabaseSync };
   } catch {
     try {
       const mod = await import("better-sqlite3");
-      sqlitePromise = { source: "better-sqlite3", BetterSqlite: mod.default || mod };
+      return { source: "better-sqlite3", BetterSqlite: mod.default || mod };
     } catch {
       console.error(
         "[DATABASE] No SQLite driver found. Node.js 22.18+ provides native 'node:sqlite', or install 'better-sqlite3'."
       );
+      return null;
     }
+  }
+}
+
+async function loadDriverModule(type) {
+  if (type === "postgres") {
+    try {
+      const mod = await import("pg");
+      return mod.default || mod;
+    } catch {
+      console.error("[DATABASE ERROR] 'pg' package is not installed. Run 'npm install pg'.");
+      return null;
+    }
+  }
+  if (type === "mysql") {
+    try {
+      return await import("mysql2/promise");
+    } catch {
+      console.error("[DATABASE ERROR] 'mysql2' package is not installed. Run 'npm install mysql2'.");
+      return null;
+    }
+  }
+  if (type === "sqlite") return loadSqliteDriver();
+  return null;
+}
+
+/**
+ * @param {string} type
+ * @returns {Promise<any|null>}
+ */
+function loadDriver(type) {
+  if (!driverCache.has(type)) driverCache.set(type, loadDriverModule(type));
+  return driverCache.get(type);
+}
+
+/**
+ * Normalizes a bound parameter for the target dialect.
+ *  - undefined -> null (drivers reject undefined)
+ *  - SQLite: booleans -> 1/0, Date -> ISO-8601, objects/arrays -> JSON
+ *  - MySQL: booleans -> 1/0, objects/arrays -> JSON (Date is handled by mysql2)
+ *  - Postgres: left as-is (pg serializes Date, arrays and JSON objects itself)
+ * @param {any} value
+ * @param {string} type
+ * @returns {any}
+ */
+function normalizeParam(value, type) {
+  if (value === undefined) return null;
+  if (value === null || type === "postgres") return value;
+  if (typeof value === "boolean") return value ? 1 : 0;
+  if (value instanceof Date) return type === "sqlite" ? value.toISOString() : value;
+  if (typeof value === "object" && !Buffer.isBuffer(value) && !ArrayBuffer.isView(value)) {
+    return JSON.stringify(value);
+  }
+  return value;
+}
+
+function normalizeParams(params, type) {
+  if (!Array.isArray(params)) return [];
+  return params.map((value) => normalizeParam(value, type));
+}
+
+/**
+ * Classifies a statement to decide how its result is returned.
+ * @param {string} sql
+ */
+function classifySql(sql) {
+  return {
+    isSelect: /^\s*\(?\s*(select|pragma|explain|with|show|describe|desc|values)\b/i.test(sql),
+    hasReturning: hasReturningClause(sql),
+    isInsert: /^\s*insert\b/i.test(sql),
+  };
+}
+
+function safeDecode(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
   }
 }
 
@@ -265,7 +336,7 @@ function hasReturningClause(sql) {
   return false;
 }
 
-const _activeDatabases = new Set();
+const _activeDatabases = (globalThis.__seip_next_active_dbs ??= new Set());
 
 /**
  * Database wrapper supporting SQLite (node:sqlite / better-sqlite3), Postgres, and MySQL.
@@ -279,7 +350,10 @@ class Database {
     this._stmtCache = new Map();
     this._maxStatements = 500;
     this._txQueue = Promise.resolve();
+    this._sqliteTxActive = false;
     this._savepointCounter = 0;
+    this._initPromise = null;
+    this._driver = null;
 
     let defaultSqliteFile = process.env.DB_FILE || "database/app.db";
     let busyTimeout = 5000;
@@ -316,11 +390,14 @@ class Database {
       }
     }
 
+    // PRAGMA values are interpolated: only accept identifiers / numbers.
+    const pragmaWord = (value, fallback) => (/^[A-Z]+$/.test(String(value)) ? String(value) : fallback);
+
     this.sqliteConfig = {
       filename: config.DB_FILE || defaultSqliteFile,
-      busyTimeout: config.busyTimeout || busyTimeout,
-      journalMode: config.journalMode || journalMode,
-      synchronous: config.synchronous || synchronous,
+      busyTimeout: parseInt(config.busyTimeout || busyTimeout, 10) || 5000,
+      journalMode: pragmaWord(String(config.journalMode || journalMode).toUpperCase(), "WAL"),
+      synchronous: pragmaWord(String(config.synchronous || synchronous).toUpperCase(), "NORMAL"),
     };
 
     this.config = {
@@ -348,9 +425,10 @@ class Database {
           const url = new URL(process.env.DATABASE_URL);
           this.config.host = url.hostname;
           this.config.port = parseInt(url.port, 10) || (this.type === "postgres" ? 5432 : 3306);
-          this.config.user = url.username;
-          this.config.password = url.password;
-          this.config.database = url.pathname.substring(1);
+          // URL keeps credentials percent-encoded ("p%40ss"); drivers need the raw value.
+          this.config.user = safeDecode(url.username);
+          this.config.password = safeDecode(url.password);
+          this.config.database = safeDecode(url.pathname.substring(1));
           this.config.connectionString = process.env.DATABASE_URL;
         }
       } catch (err) {
@@ -376,14 +454,30 @@ class Database {
 
   /**
    * Initializes connection pool or SQLite database.
+   * Concurrent callers share the same in-flight initialization (no duplicated pools).
    * @param {number} [retries=3]
    * @returns {Promise<boolean>}
    */
   async init(retries = 3) {
-    if (!mysqlPromise && !pgPromise && !sqlitePromise) return false;
     if (this.pool || this.db) return true;
+    if (!this._initPromise) {
+      this._initPromise = this._doInit(retries).finally(() => {
+        this._initPromise = null;
+      });
+    }
+    return this._initPromise;
+  }
 
-    if (this.type === "sqlite" && sqlitePromise) {
+  async _doInit(retries) {
+    const driver = await loadDriver(this.type);
+    if (!driver) {
+      console.error(`[DATABASE ERROR] No driver available for database type '${this.type}'.`);
+      return false;
+    }
+    this._driver = driver;
+    _activeDatabases.add(this);
+
+    if (this.type === "sqlite") {
       try {
         const isMemoryDb = this.sqliteConfig.filename === ":memory:";
         const isDesktop = Config.isDesktop();
@@ -424,8 +518,8 @@ class Database {
           }
         }
 
-        if (sqlitePromise.source === "node:sqlite") {
-          const { DatabaseSync } = sqlitePromise;
+        if (driver.source === "node:sqlite") {
+          const { DatabaseSync } = driver;
           this.db = new DatabaseSync(dbFilePath);
           this._sqliteDriver = "node:sqlite";
           this.db.exec(`PRAGMA journal_mode = ${this.sqliteConfig.journalMode};`);
@@ -435,7 +529,7 @@ class Database {
           this.db.exec("PRAGMA temp_store = MEMORY;");
           this.db.exec("PRAGMA cache_size = -8000;");
         } else {
-          const { BetterSqlite } = sqlitePromise;
+          const { BetterSqlite } = driver;
           this.db = new BetterSqlite(dbFilePath, { timeout: this.sqliteConfig.busyTimeout });
           this._sqliteDriver = "better-sqlite3";
           this.db.pragma(`journal_mode = ${this.sqliteConfig.journalMode}`);
@@ -454,28 +548,32 @@ class Database {
       }
     }
 
-    // No driver available for this dialect: fail instead of pretending to succeed.
-    const canInitPostgres = this.type === "postgres" && Boolean(pgPromise);
-    const canInitMysql = this.type === "mysql" && Boolean(mysqlPromise);
-    if (!canInitPostgres && !canInitMysql) {
-      console.error(`[DATABASE ERROR] No driver available for database type '${this.type}'.`);
-      return false;
-    }
-
     for (let attempt = 1; attempt <= retries; attempt++) {
+      let pool = null;
       try {
-        if (canInitPostgres) {
-          const pg = pgPromise.default || pgPromise;
-          this.pool = new pg.Pool(this.config);
-          await this.pool.query("SELECT 1");
+        if (this.type === "postgres") {
+          pool = new driver.Pool(this.config);
+          // Without a listener, an idle-client error (DB restart, network cut)
+          // is an unhandled 'error' event and crashes the whole Next.js process.
+          pool.on("error", (err) => {
+            console.error("[DATABASE ERROR] Idle Postgres client error:", err.message);
+          });
         } else {
           const { max, connectionString, ...mysqlConfig } = this.config;
-          this.pool = mysqlPromise.createPool(mysqlConfig);
-          await this.pool.query("SELECT 1");
+          // Store/read DATETIME values as UTC unless told otherwise.
+          if (mysqlConfig.timezone === undefined) mysqlConfig.timezone = "Z";
+          pool = driver.createPool(mysqlConfig);
+          pool.pool?.on?.("error", (err) => {
+            console.error("[DATABASE ERROR] MySQL pool error:", err.message);
+          });
         }
+        await pool.query("SELECT 1");
+        this.pool = pool;
         return true;
       } catch (err) {
-        this.pool = null;
+        if (pool && typeof pool.end === "function") {
+          await pool.end().catch(() => {});
+        }
         if (attempt === retries) {
           console.error(`[DATABASE ERROR] Connection failed after ${retries} attempts:`, err.message);
           return false;
@@ -486,82 +584,97 @@ class Database {
     return false;
   }
 
+  async _ensureReady() {
+    if (this.pool || this.db) return true;
+    return this.init();
+  }
+
+  /** @returns {object|null} The transaction store when the caller runs inside one of THIS database's transactions. */
+  _ownTxStore() {
+    const store = txContext.getStore();
+    return store && store.db === this ? store : null;
+  }
+
+  /**
+   * SQLite has a single connection: while a transaction is open, statements from
+   * other requests would silently join it (and be rolled back with it). They wait here.
+   */
+  async _waitSqliteIdle() {
+    while (this._sqliteTxActive) {
+      await this._txQueue;
+    }
+  }
+
+  _sqliteExec(cleanSql, params, queryOptions, kind) {
+    const stmt = this._getPreparedStatement(cleanSql);
+    if (kind.isSelect || kind.hasReturning) {
+      if (queryOptions.return_row) {
+        const row = stmt.get(...params);
+        return row || null;
+      }
+      return stmt.all(...params);
+    }
+    const info = stmt.run(...params);
+    if (kind.isInsert) return Number(info.lastInsertRowid);
+    return info.changes;
+  }
+
+  async _pgExec(client, cleanSql, params, queryOptions, kind) {
+    const res = await client.query(toPostgresSql(cleanSql), params);
+    if (kind.isSelect || kind.hasReturning) {
+      const rows = res.rows || [];
+      return queryOptions.return_row ? (rows[0] || null) : rows;
+    }
+    if (kind.isInsert && res.rows && res.rows.length > 0) {
+      return res.rows[0].id ?? res.rows[0];
+    }
+    return res.rowCount;
+  }
+
+  async _mysqlExec(client, cleanSql, params, queryOptions, kind) {
+    const [results] = await client.execute(cleanSql, params);
+    if (kind.isSelect || kind.hasReturning) {
+      const rows = Array.isArray(results) ? results : [];
+      return queryOptions.return_row ? (rows[0] || null) : rows;
+    }
+    if (kind.isInsert && results && results.insertId !== undefined && results.insertId !== null) {
+      return results.insertId;
+    }
+    return results;
+  }
+
   /**
    * Runs a SQL query with parameters and formatting options.
+   * Inside a `transaction()` callback it automatically runs on the transaction's connection.
    * @param {string} sql - SQL query string.
    * @param {Array} [params=[]] - Query parameters.
    * @param {Object|string} [options={}] - Query options.
    * @returns {Promise<*>}
    */
   async query(sql, params = [], options = {}) {
-    if (!mysqlPromise && !pgPromise && !sqlitePromise) return false;
-    if (!this.pool && !this.db) {
-      const initialized = await this.init();
-      if (!initialized) return false;
-    }
+    return this._query(sql, params, options, this._ownTxStore());
+  }
 
-    const queryOptions = typeof options === "string" ? { [options]: true } : options;
-    const cleanSql = sql.trim();
-    const isSelect = /^\s*(select|pragma|explain|with)\b/i.test(cleanSql);
-    const hasReturning = hasReturningClause(cleanSql);
-    const isInsert = /^\s*insert\b/i.test(cleanSql);
+  async _query(sql, params, options, store) {
+    if (!(await this._ensureReady())) return false;
+
+    const queryOptions = typeof options === "string" ? { [options]: true } : options || {};
+    const cleanSql = String(sql).trim();
+    const kind = classifySql(cleanSql);
+    const bound = normalizeParams(params, this.type);
 
     try {
       if (this.type === "sqlite" && this.db) {
-        const stmt = this._getPreparedStatement(cleanSql);
-
-        if (isSelect || hasReturning) {
-          if (queryOptions.return_row) {
-            const row = stmt.get(...params);
-            return row || null;
-          }
-          const rows = stmt.all(...params);
-          return rows;
-        }
-
-        if (isInsert) {
-          const info = stmt.run(...params);
-          return Number(info.lastInsertRowid);
-        }
-
-        const info = stmt.run(...params);
-        return info.changes;
-      } else if (this.type === "postgres" && pgPromise) {
-        const pgSql = toPostgresSql(cleanSql);
-        const res = await this.pool.query(pgSql, params);
-
-        if (isSelect || hasReturning) {
-          const rows = res.rows || [];
-          return queryOptions.return_row ? (rows.length > 0 ? rows[0] : null) : rows;
-        }
-
-        if (isInsert) {
-          if (res.rows && res.rows.length > 0) {
-            return res.rows[0].id || res.rows[0];
-          }
-          return res.rowCount;
-        }
-
-        return res.rowCount;
-      } else if (this.type === "mysql" && this.pool) {
-        const [results] = await this.pool.execute(cleanSql, params);
-
-        if (isSelect || hasReturning) {
-          const rows = Array.isArray(results) ? results : [];
-          return queryOptions.return_row ? (rows.length > 0 ? rows[0] : null) : rows;
-        }
-
-        if (isInsert) {
-          if (results && results.insertId !== undefined && results.insertId !== null) {
-            return results.insertId;
-          }
-          return results;
-        }
-
-        return results;
-      } else {
-        throw new Error(`[DATABASE ERROR] No connection available for database type '${this.type}'.`);
+        if (!store && this._sqliteTxActive) await this._waitSqliteIdle();
+        return this._sqliteExec(cleanSql, bound, queryOptions, kind);
       }
+      if (this.type === "postgres" && this.pool) {
+        return await this._pgExec(store?.client || this.pool, cleanSql, bound, queryOptions, kind);
+      }
+      if (this.type === "mysql" && this.pool) {
+        return await this._mysqlExec(store?.client || this.pool, cleanSql, bound, queryOptions, kind);
+      }
+      throw new Error(`[DATABASE ERROR] No connection available for database type '${this.type}'.`);
     } catch (err) {
       if (!queryOptions.silent) {
         console.error("[DATABASE ERROR] Query execution failed:", err.message);
@@ -574,12 +687,13 @@ class Database {
    * Executes a paginated SQL query.
    * @param {string} sql
    * @param {Array} [params=[]]
-   * @param {Object} [options={}]
+   * @param {Object} [options={}] - { page, limit, maxLimit = 100 }
    * @returns {Promise<{data: Array, total: number, page: number, limit: number, totalPages: number}>}
    */
   async paginate(sql, params = [], options = {}) {
+    const maxLimit = Math.max(1, parseInt(options.maxLimit, 10) || 100);
     const page = Math.max(1, parseInt(options.page, 10) || 1);
-    const limit = Math.max(1, parseInt(options.limit, 10) || 10);
+    const limit = Math.min(maxLimit, Math.max(1, parseInt(options.limit, 10) || 10));
     const offset = (page - 1) * limit;
 
     const cleanSql = sql.trim().replace(/;$/, "");
@@ -590,7 +704,8 @@ class Database {
     const totalPages = Math.ceil(total / limit);
 
     const paginatedSql = `${cleanSql} LIMIT ${limit} OFFSET ${offset}`;
-    const rows = await this.query(paginatedSql, params, options);
+    const { page: _p, limit: _l, maxLimit: _m, ...queryOptions } = options;
+    const rows = await this.query(paginatedSql, params, queryOptions);
 
     return {
       data: Array.isArray(rows) ? rows : [],
@@ -603,46 +718,35 @@ class Database {
 
   /**
    * Executes a database transaction with automatic commit and rollback.
+   * Nested calls (inside the callback) become SAVEPOINTs on the same connection.
+   * Inside the callback, both `tx.query()` and `db.query()` run on the transaction.
    * @param {Function} callback - async (tx) => { ... }
    * @returns {Promise<*>}
    */
   async transaction(callback) {
-    if (!mysqlPromise && !pgPromise && !sqlitePromise) throw new Error("[DATABASE ERROR] No database driver available.");
-    if (!this.pool && !this.db) {
-      const initialized = await this.init();
-      if (!initialized) throw new Error("[DATABASE ERROR] Failed to initialize database.");
+    if (!(await this._ensureReady())) {
+      throw new Error("[DATABASE ERROR] Failed to initialize database.");
     }
 
+    const current = this._ownTxStore();
+    if (current) return this._nestedTransaction(current, callback);
+
     if (this.type === "sqlite" && this.db) {
-      return this._sqliteTransaction(callback);
-    } else if (this.type === "postgres" && pgPromise) {
+      const run = () => this._sqliteRootTransaction(callback);
+      const queued = this._txQueue.then(run, run);
+      this._txQueue = queued.then(
+        () => undefined,
+        () => undefined
+      );
+      return queued;
+    }
+
+    if (this.type === "postgres" && this.pool) {
       const client = await this.pool.connect();
+      const store = { db: this, client };
       try {
         await client.query("BEGIN");
-        const tx = {
-          query: async (sql, params = [], options = {}) => {
-            const queryOptions = typeof options === "string" ? { [options]: true } : options;
-            const cleanSql = sql.trim();
-            const isSelect = /^\s*(select|pragma|explain|with)\b/i.test(cleanSql);
-            const hasReturning = hasReturningClause(cleanSql);
-            const isInsert = /^\s*insert\b/i.test(cleanSql);
-
-            const pgSql = toPostgresSql(cleanSql);
-            const res = await client.query(pgSql, params);
-
-            if (isSelect || hasReturning) {
-              const rows = res.rows || [];
-              return queryOptions.return_row ? (rows[0] || null) : rows;
-            }
-            if (isInsert) {
-              if (res.rows && res.rows.length > 0) return res.rows[0].id || res.rows[0];
-              return res.rowCount;
-            }
-            return res.rowCount;
-          },
-        };
-
-        const result = await callback(tx);
+        const result = await txContext.run(store, () => callback(this._txHandle(store)));
         await client.query("COMMIT");
         return result;
       } catch (err) {
@@ -652,34 +756,14 @@ class Database {
       } finally {
         client.release();
       }
-    } else if (this.type === "mysql" && this.pool) {
+    }
+
+    if (this.type === "mysql" && this.pool) {
       const connection = await this.pool.getConnection();
+      const store = { db: this, client: connection };
       try {
         await connection.beginTransaction();
-        const tx = {
-          query: async (sql, params = [], options = {}) => {
-            const queryOptions = typeof options === "string" ? { [options]: true } : options;
-            const cleanSql = sql.trim();
-            const isSelect = /^\s*(select|pragma|explain|with)\b/i.test(cleanSql);
-            const hasReturning = hasReturningClause(cleanSql);
-            const isInsert = /^\s*insert\b/i.test(cleanSql);
-
-            const [results] = await connection.execute(cleanSql, params);
-            if (isSelect || hasReturning) {
-              const rows = Array.isArray(results) ? results : [];
-              return queryOptions.return_row ? (rows[0] || null) : rows;
-            }
-            if (isInsert) {
-              if (results && results.insertId !== undefined && results.insertId !== null) {
-                return results.insertId;
-              }
-              return results;
-            }
-            return results;
-          },
-        };
-
-        const result = await callback(tx);
+        const result = await txContext.run(store, () => callback(this._txHandle(store)));
         await connection.commit();
         return result;
       } catch (err) {
@@ -689,65 +773,33 @@ class Database {
       } finally {
         connection.release();
       }
-    } else {
-      throw new Error(`[DATABASE ERROR] No connection available for database type '${this.type}'.`);
     }
+
+    throw new Error(`[DATABASE ERROR] No connection available for database type '${this.type}'.`);
   }
 
-  /**
-   * Query adapter bound to the current SQLite transaction.
-   * @returns {(sql: string, params?: any[], options?: Object|string) => Promise<any>}
-   */
-  _sqliteTxQuery() {
-    return async (sql, params = [], options = {}) => {
-      const queryOptions = typeof options === "string" ? { [options]: true } : options;
-      const cleanSql = sql.trim();
-      const isSelect = /^\s*(select|pragma|explain|with)\b/i.test(cleanSql);
-      const hasReturning = hasReturningClause(cleanSql);
-      const isInsert = /^\s*insert\b/i.test(cleanSql);
-
-      const stmt = this._getPreparedStatement(cleanSql);
-      if (isSelect || hasReturning) {
-        if (queryOptions.return_row) {
-          const row = stmt.get(...params);
-          return row || null;
-        }
-        return stmt.all(...params);
-      }
-      if (isInsert) {
-        const info = stmt.run(...params);
-        return Number(info.lastInsertRowid);
-      }
-      const info = stmt.run(...params);
-      return info.changes;
+  /** Query handle bound to a transaction store. */
+  _txHandle(store) {
+    return {
+      query: (sql, params = [], options = {}) => this._query(sql, params, options, store),
     };
   }
 
   /**
-   * Runs a SQLite transaction. Top-level transactions are serialized through a
-   * queue (one connection), while nested calls become SAVEPOINTs so they can be
-   * rolled back independently without destroying the outer transaction.
-   * @param {Function} callback
-   * @returns {Promise<any>}
+   * Runs a statement that does not go through the prepared-statement path
+   * (BEGIN / SAVEPOINT / RELEASE ...) on the transaction's connection.
    */
-  async _sqliteTransaction(callback) {
-    if (txContext.getStore()) {
-      return this._sqliteNestedTransaction(callback);
-    }
-
-    const run = () => txContext.run({}, () => this._sqliteRootTransaction(callback));
-    const queued = this._txQueue.then(run, run);
-    this._txQueue = queued.then(
-      () => undefined,
-      () => undefined
-    );
-    return queued;
+  async _txControl(store, sql) {
+    if (this.type === "sqlite") return this.db.exec(sql);
+    return store.client.query(sql);
   }
 
   async _sqliteRootTransaction(callback) {
+    const store = { db: this, client: null };
     this.db.exec("BEGIN IMMEDIATE");
+    this._sqliteTxActive = true;
     try {
-      const result = await callback({ query: this._sqliteTxQuery() });
+      const result = await txContext.run(store, () => callback(this._txHandle(store)));
       this.db.exec("COMMIT");
       return result;
     } catch (err) {
@@ -756,20 +808,22 @@ class Database {
       } catch {}
       console.error("[DATABASE ERROR] Transaction rolled back:", err.message);
       throw err;
+    } finally {
+      this._sqliteTxActive = false;
     }
   }
 
-  async _sqliteNestedTransaction(callback) {
+  async _nestedTransaction(store, callback) {
     const savepoint = `seip_sp_${++this._savepointCounter}`;
-    this.db.exec(`SAVEPOINT ${savepoint}`);
+    await this._txControl(store, `SAVEPOINT ${savepoint}`);
     try {
-      const result = await callback({ query: this._sqliteTxQuery() });
-      this.db.exec(`RELEASE ${savepoint}`);
+      const result = await callback(this._txHandle(store));
+      await this._txControl(store, `RELEASE SAVEPOINT ${savepoint}`);
       return result;
     } catch (err) {
       try {
-        this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
-        this.db.exec(`RELEASE ${savepoint}`);
+        await this._txControl(store, `ROLLBACK TO SAVEPOINT ${savepoint}`);
+        await this._txControl(store, `RELEASE SAVEPOINT ${savepoint}`);
       } catch {}
       throw err;
     }
@@ -779,6 +833,7 @@ class Database {
    * Closes the database connection pool or SQLite instance, checkpointing WAL if SQLite.
    */
   async close() {
+    if (this._initPromise) await this._initPromise.catch(() => {});
     this._stmtCache.clear();
     if (this.db) {
       try {
@@ -792,10 +847,11 @@ class Database {
       this.db = null;
     }
     if (this.pool) {
-      if (typeof this.pool.end === "function") {
-        await this.pool.end();
-      }
+      const pool = this.pool;
       this.pool = null;
+      if (typeof pool.end === "function") {
+        await pool.end();
+      }
     }
     _activeDatabases.delete(this);
   }
@@ -824,5 +880,5 @@ if (!globalThis.__seip_next_db_instance) {
 const database = globalThis.__seip_next_db_instance;
 const db = database;
 
-export { Database, database, db, DB_TYPE, toPostgresSql };
+export { Database, database, db, DB_TYPE, toPostgresSql, normalizeParam };
 export default database;

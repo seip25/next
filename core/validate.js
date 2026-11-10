@@ -18,6 +18,8 @@ const messages_default = {
     required: (f) => `El campo ${f} es obligatorio`,
     min: (f, n) => `El campo ${f} debe tener al menos ${n} caracteres`,
     max: (f, n) => `El campo ${f} no puede tener más de ${n} caracteres`,
+    minValue: (f, n) => `El campo ${f} debe ser mayor o igual a ${n}`,
+    maxValue: (f, n) => `El campo ${f} debe ser menor o igual a ${n}`,
     email: (f) => `El campo ${f} debe ser un email válido`,
     number: (f) => `El campo ${f} debe ser numérico`,
     alpha: (f) => `El campo ${f} solo puede contener letras`,
@@ -34,6 +36,8 @@ const messages_default = {
     required: (f) => `${f} is required`,
     min: (f, n) => `${f} must be at least ${n} characters`,
     max: (f, n) => `${f} must be at most ${n} characters`,
+    minValue: (f, n) => `${f} must be greater than or equal to ${n}`,
+    maxValue: (f, n) => `${f} must be less than or equal to ${n}`,
     email: (f) => `${f} must be a valid email`,
     number: (f) => `${f} must be numeric`,
     alpha: (f) => `${f} must contain only letters`,
@@ -50,6 +54,8 @@ const messages_default = {
     required: (f) => `O campo ${f} é obrigatório`,
     min: (f, n) => `O campo ${f} deve ter pelo menos ${n} caracteres`,
     max: (f, n) => `O campo ${f} não pode ter mais de ${n} caracteres`,
+    minValue: (f, n) => `O campo ${f} deve ser maior ou igual a ${n}`,
+    maxValue: (f, n) => `O campo ${f} deve ser menor ou igual a ${n}`,
     email: (f) => `O campo ${f} deve ser um email válido`,
     number: (f) => `O campo ${f} deve ser numérico`,
     alpha: (f) => `O campo ${f} só pode conter letras`,
@@ -66,6 +72,8 @@ const messages_default = {
     required: (f) => `O campo ${f} é obrigatório`,
     min: (f, n) => `O campo ${f} deve ter pelo menos ${n} caracteres`,
     max: (f, n) => `O campo ${f} não pode ter mais de ${n} caracteres`,
+    minValue: (f, n) => `O campo ${f} deve ser maior ou igual a ${n}`,
+    maxValue: (f, n) => `O campo ${f} deve ser menor ou igual a ${n}`,
     email: (f) => `O campo ${f} deve ser um email válido`,
     number: (f) => `O campo ${f} deve ser numérico`,
     alpha: (f) => `O campo ${f} só pode conter letras`,
@@ -82,6 +90,8 @@ const messages_default = {
     required: (f) => `Le champ ${f} est obligatoire`,
     min: (f, n) => `Le champ ${f} doit contenir au moins ${n} caractères`,
     max: (f, n) => `Le champ ${f} ne peut pas contenir plus de ${n} caractères`,
+    minValue: (f, n) => `Le champ ${f} doit être supérieur ou égal à ${n}`,
+    maxValue: (f, n) => `Le champ ${f} doit être inférieur ou égal à ${n}`,
     email: (f) => `Le champ ${f} doit être un email valide`,
     number: (f) => `Le champ ${f} doit être numérique`,
     alpha: (f) => `Le champ ${f} ne peut contenir que des lettres`,
@@ -143,35 +153,73 @@ class Validator {
   }
 
   /**
+   * Extracts a plain object from FormData / URLSearchParams, a Web Request
+   * (JSON, multipart or urlencoded), an Express-like request ({ body, headers })
+   * or a plain object. A plain object with a field named "body" is NOT unwrapped.
+   * @param {any} input
+   * @returns {Promise<Object>}
+   */
+  static async readInput(input) {
+    if (!input || typeof input !== "object") return {};
+
+    const fromEntries = (iterable) => {
+      const out = {};
+      for (const [key, val] of iterable.entries()) {
+        if (key in out) {
+          out[key] = Array.isArray(out[key]) ? [...out[key], val] : [out[key], val];
+        } else {
+          out[key] = val;
+        }
+      }
+      return out;
+    };
+
+    // FormData or URLSearchParams
+    if (typeof input.entries === "function" && typeof input.get === "function") {
+      return fromEntries(input);
+    }
+
+    // Web Request / NextRequest
+    if (typeof input.json === "function" && typeof input.headers?.get === "function") {
+      const contentType = String(input.headers.get("content-type") || "").toLowerCase();
+      try {
+        if (contentType.includes("multipart/form-data") || contentType.includes("application/x-www-form-urlencoded")) {
+          return fromEntries(await input.formData());
+        }
+        const json = await input.json();
+        return json && typeof json === "object" && !Array.isArray(json) ? json : {};
+      } catch {
+        return {};
+      }
+    }
+
+    // Express / Node-style request: { body, headers, method }
+    const looksLikeRequest = "headers" in input && ("method" in input || "url" in input);
+    if (looksLikeRequest && input.body && typeof input.body === "object") {
+      return { ...input.body };
+    }
+
+    return { ...input };
+  }
+
+  /**
    * Validates plain objects, FormData, or Request payloads.
+   * `data` only contains fields declared in the schema (prevents mass assignment,
+   * e.g. a forged "role" field); `raw` keeps the full parsed input.
    * @param {Object|FormData} input
    * @param {string} [langOverride]
    * @returns {Promise<{success: boolean, error: boolean, errors: Array<{field: string, message: string}>, message: string[], data: Object}>}
    */
   async validate(input, langOverride = null) {
-    let body = {};
-
-    if (input && typeof input.entries === "function") {
-      // FormData or URLSearchParams
-      for (const [key, val] of input.entries()) {
-        body[key] = val;
-      }
-    } else if (input && typeof input.json === "function") {
-      // NextRequest
-      try {
-        body = await input.json();
-      } catch {
-        body = {};
-      }
-    } else if (input && typeof input === "object") {
-      body = input.body ? input.body : { ...input };
-    }
-
+    const body = await Validator.readInput(input);
     const lang = langOverride || this.lang_default || "es";
     const msg = this.messages[lang] || this.messages.es || this.messages.en;
     const errors = [];
     const messages = [];
-    const sanitizedData = { ...body };
+    const sanitizedData = {};
+    for (const field of Object.keys(this.schema)) {
+      if (Object.prototype.hasOwnProperty.call(body, field)) sanitizedData[field] = body[field];
+    }
 
     for (const [field, config] of Object.entries(this.schema)) {
       let value = sanitizedData[field];
@@ -189,19 +237,23 @@ class Validator {
       }
 
       if (!validators.isEmpty(value)) {
-        if (
-          config.min !== undefined &&
-          !validators.isLength(value, { min: config.min })
-        ) {
-          const errorMsg = config.messages?.min || msg.min(field, config.min);
+        const numeric = Boolean(config.number) || typeof value === "number";
+        const tooSmall = numeric
+          ? config.min !== undefined && validators.isNumeric(value) && Number(value) < config.min
+          : config.min !== undefined && !validators.isLength(value, { min: config.min });
+        const tooBig = numeric
+          ? config.max !== undefined && validators.isNumeric(value) && Number(value) > config.max
+          : config.max !== undefined && !validators.isLength(value, { max: config.max });
+
+        if (tooSmall) {
+          const errorMsg =
+            config.messages?.min || ((numeric && msg.minValue) ? msg.minValue(field, config.min) : msg.min(field, config.min));
           messages.push(errorMsg);
           errors.push({ field, message: errorMsg });
         }
-        if (
-          config.max !== undefined &&
-          !validators.isLength(value, { max: config.max })
-        ) {
-          const errorMsg = config.messages?.max || msg.max(field, config.max);
+        if (tooBig) {
+          const errorMsg =
+            config.messages?.max || ((numeric && msg.maxValue) ? msg.maxValue(field, config.max) : msg.max(field, config.max));
           messages.push(errorMsg);
           errors.push({ field, message: errorMsg });
         }
@@ -276,6 +328,7 @@ class Validator {
         errors,
         message: messages,
         data: sanitizedData,
+        raw: body,
       };
     }
 
@@ -285,6 +338,7 @@ class Validator {
       errors: [],
       message: [],
       data: sanitizedData,
+      raw: body,
     };
   }
 

@@ -1,9 +1,15 @@
 import crypto from "node:crypto";
 
-let bcryptModule = null;
-try {
-  bcryptModule = (await import("bcrypt")).default || (await import("bcrypt"));
-} catch {}
+/** bcrypt is optional and loaded lazily (only when a bcrypt hash/driver is used). */
+let bcryptPromise = null;
+function loadBcrypt() {
+  if (!bcryptPromise) {
+    bcryptPromise = import("bcrypt")
+      .then((mod) => mod.default || mod)
+      .catch(() => null);
+  }
+  return bcryptPromise;
+}
 
 /**
  * High-performance Password Hashing class for Next.js and Node.js.
@@ -30,6 +36,7 @@ class Hash {
     const driver = (options.driver || "scrypt").toLowerCase();
 
     if (driver === "bcrypt") {
+      const bcryptModule = await loadBcrypt();
       if (!bcryptModule) {
         throw new Error(
           "[HASH ERROR] 'bcrypt' package is not installed. Run 'npm install bcrypt' or use the default native scrypt driver."
@@ -83,6 +90,7 @@ class Hash {
     }
 
     if (/^\$2[aby]\$\d{2}\$/.test(hash)) {
+      const bcryptModule = await loadBcrypt();
       if (!bcryptModule) {
         console.error(
           "[HASH ERROR] A bcrypt hash was detected, but 'bcrypt' package is not installed. Run 'npm install bcrypt'."

@@ -152,9 +152,11 @@ test("Seo: intelligent route filtering excludes protected routes", () => {
   assert.ok(!routes.includes("/login"));
 
   const robots = Seo.generateRobots("https://project.com");
-  assert.ok(robots.includes("Disallow: /dashboard/"));
-  assert.ok(robots.includes("Disallow: /admin/"));
-  assert.ok(robots.includes("Disallow: /api/"));
+  // No trailing slash: "Disallow: /login/" would leave "/login" itself crawlable.
+  assert.match(robots, /^Disallow: \/dashboard$/m);
+  assert.match(robots, /^Disallow: \/admin$/m);
+  assert.match(robots, /^Disallow: \/api$/m);
+  assert.match(robots, /^Disallow: \/login$/m);
   assert.ok(robots.includes("Sitemap: https://project.com/sitemap.xml"));
 
   const sitemap = Seo.generateSitemap("https://project.com");
@@ -169,8 +171,7 @@ test("IA: cache hit, custom systemPrompt and decoupled onLog hook", async () => 
   const answer = "Atendemos de lunes a viernes de 9 a 18 hs.";
 
   // Pre-populate in-memory cache
-  const year = new Date().getFullYear();
-  IA.cache.set(`${year}-${userQuestion.toLowerCase()}`, answer);
+  IA.cache.set(IA.cacheKey({ message: userQuestion, systemPrompt: "Eres un bot de prueba." }), answer);
 
   let loggedItem = null;
 

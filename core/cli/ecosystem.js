@@ -28,6 +28,14 @@ export function parseEnv(envPath) {
 
 /**
  * Generates PM2 ecosystem.config.cjs optimized for Next.js production on VPS.
+ *
+ * - Secrets are NOT copied into the file: the generated config reads .env when PM2
+ *   loads it, so ecosystem.config.cjs can be committed and secrets stay in .env.
+ * - Next.js binds to 127.0.0.1 by default (nginx is the public entry point), so the
+ *   app cannot be reached directly bypassing nginx (and its X-Real-IP header).
+ * - With `output: "standalone"`, server.js chdir()s into .next/standalone, which is
+ *   wiped on every build: APP_DIR pins the project root so the SQLite DB, uploads and
+ *   revoked sessions stay in the project, and HOSTNAME (not HOST) sets the bind address.
  */
 export function makeEcosystem() {
   const cwd = process.cwd();
@@ -40,96 +48,135 @@ export function makeEcosystem() {
     .replace(/[^a-z0-9_-]/g, "-");
 
   const port = env.PORT || "3000";
-  const host = env.HOST || "0.0.0.0";
-  const maxMemory = env.PM2_MAX_MEMORY || "500M";
+  const host = env.HOST || "127.0.0.1";
+  const maxMemory = env.PM2_MAX_MEMORY || "1G";
+  const projectRoot = cwd.replace(/\\/g, "/");
 
-  // Check if standalone Next.js server exists
-  const hasStandalone =
-    fs.existsSync(path.join(cwd, ".next/standalone/server.js")) ||
-    fs.existsSync(path.join(cwd, "server.js"));
-
-  const mainScript = hasStandalone
-    ? (fs.existsSync(path.join(cwd, ".next/standalone/server.js")) ? ".next/standalone/server.js" : "server.js")
-    : "node_modules/next/dist/bin/next";
-
+  const standalonePath = [".next/standalone/server.js", "server.js"].find((f) => fs.existsSync(path.join(cwd, f)));
+  const hasStandalone = Boolean(standalonePath);
+  const mainScript = standalonePath || "node_modules/next/dist/bin/next";
   const mainArgs = hasStandalone ? "" : `start -p ${port} -H ${host}`;
 
-  const mainApp = {
-    name: appName,
-    cwd: cwd.replace(/\\/g, "/"),
-    script: mainScript,
-    ...(mainArgs ? { args: mainArgs } : {}),
-    instances: 1,
-    exec_mode: "fork",
-    autorestart: true,
-    watch: false,
-    max_memory_restart: maxMemory,
-    env: {
-      NODE_ENV: "production",
-      PORT: port,
-      HOST: host,
-      APP_URL: env.APP_URL || `http://${host}:${port}`,
-      DB_FILE: env.DB_FILE || "database/app.db",
-      ...(env.JWT_SECRET ? { JWT_SECRET: env.JWT_SECRET } : {}),
-      ...(env.DATABASE_URL ? { DATABASE_URL: env.DATABASE_URL } : {}),
-      ...(env.DEEPSEEK_API_KEY ? { DEEPSEEK_API_KEY: env.DEEPSEEK_API_KEY } : {}),
-      ...(env.OPENAI_API_KEY ? { OPENAI_API_KEY: env.OPENAI_API_KEY } : {}),
-    },
-    error_file: "logs/pm2-error.log",
-    out_file: "logs/pm2-out.log",
-    merge_logs: true,
-    time: true,
-  };
-
-  const apps = [mainApp];
-
-  // Optional WebSocket standalone worker
   const wsCandidates = ["server/ws.js", "ws.js", "server/websocket.js"];
   const wsFile = wsCandidates.find((f) => fs.existsSync(path.join(cwd, f)));
+  const withWs = Boolean(wsFile) || process.argv.includes("--with-ws");
+  const wsPort = env.WS_PORT || "3001";
 
-  if (wsFile || process.argv.includes("--with-ws")) {
-    const wsScript = wsFile || "server/ws.js";
-    const wsPort = env.WS_PORT || "3001";
-    apps.push({
-      name: `${appName}-ws`,
-      cwd: cwd.replace(/\\/g, "/"),
-      script: wsScript,
+  if (!env.APP_URL) {
+    console.log(
+      colors.yellow("[WARN] APP_URL is not set in .env. Set it to your public URL (e.g. https://midominio.com) for sitemap/robots and redirects.")
+    );
+  }
+
+  const mainApp = `{
+      name: ${JSON.stringify(appName)},
+      cwd: ROOT,
+      script: ${JSON.stringify(mainScript)},${mainArgs ? `\n      args: ${JSON.stringify(mainArgs)},` : ""}
+      instances: 1,
+      exec_mode: "fork",
+      autorestart: true,
+      watch: false,
+      max_memory_restart: ${JSON.stringify(maxMemory)},
+      kill_timeout: 10000,
+      env: {
+        ...dotenv,
+        NODE_ENV: "production",
+        APP_DIR: ROOT,
+        PORT: dotenv.PORT || ${JSON.stringify(port)},
+        HOST: dotenv.HOST || ${JSON.stringify(host)},
+        HOSTNAME: dotenv.HOST || ${JSON.stringify(host)},
+        APP_URL: dotenv.APP_URL || ${JSON.stringify(`http://localhost:${port}`)},
+      },
+      error_file: "logs/pm2-error.log",
+      out_file: "logs/pm2-out.log",
+      merge_logs: true,
+      time: true,
+    }`;
+
+  const wsApp = `{
+      name: ${JSON.stringify(`${appName}-ws`)},
+      cwd: ROOT,
+      script: ${JSON.stringify(wsFile || "server/ws.js")},
       instances: 1,
       exec_mode: "fork",
       autorestart: true,
       watch: false,
       max_memory_restart: "256M",
       env: {
+        ...dotenv,
         NODE_ENV: "production",
-        WS_PORT: wsPort,
-        ...(env.JWT_SECRET ? { JWT_SECRET: env.JWT_SECRET } : {}),
+        APP_DIR: ROOT,
+        WS_PORT: dotenv.WS_PORT || ${JSON.stringify(wsPort)},
+        WS_HOST: dotenv.WS_HOST || "127.0.0.1",
       },
       error_file: "logs/pm2-ws-error.log",
       out_file: "logs/pm2-ws-out.log",
       merge_logs: true,
       time: true,
-    });
-  }
+    }`;
 
   const fileContent = `/**
  * PM2 Ecosystem Configuration for Next.js
  * Generated by: npx @seip/nextjs make:ecosystem
- * Deployment directory: ${cwd.replace(/\\/g, "/")}
+ *
+ * Variables are read from .env every time PM2 loads this file (pm2 start / pm2 reload),
+ * so secrets are never written here. After editing .env run:
+ *   pm2 reload ecosystem.config.cjs --update-env
  */
+const fs = require("node:fs");
+const path = require("node:path");
+
+const ROOT = __dirname;
+
+function loadEnv(file) {
+  const out = {};
+  if (!fs.existsSync(file)) return out;
+  for (const line of fs.readFileSync(file, "utf8").split(/\\r?\\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const idx = trimmed.indexOf("=");
+    if (idx === -1) continue;
+    const key = trimmed.slice(0, idx).replace(/^export\\s+/, "").trim();
+    let val = trimmed.slice(idx + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    out[key] = val;
+  }
+  return out;
+}
+
+// Same precedence as Next.js in production: .env.production.local > .env.local > .env.production > .env
+const dotenv = Object.assign(
+  {},
+  loadEnv(path.join(ROOT, ".env")),
+  loadEnv(path.join(ROOT, ".env.production")),
+  loadEnv(path.join(ROOT, ".env.local")),
+  loadEnv(path.join(ROOT, ".env.production.local"))
+);
 
 module.exports = {
-  apps: ${JSON.stringify(apps, null, 4)}
+  apps: [
+    ${withWs ? `${mainApp},\n    ${wsApp}` : mainApp}
+  ],
 };
 `;
 
   try {
     fs.mkdirSync(path.join(cwd, "logs"), { recursive: true });
     fs.writeFileSync(outputPath, fileContent, "utf-8");
-    console.log(colors.green(`[OK] Generated ecosystem.config.cjs for '${appName}' (port: ${port}).`));
+    console.log(colors.green(`[OK] Generated ecosystem.config.cjs for '${appName}' (port: ${port}, host: ${host}).`));
   } catch (err) {
     console.error(colors.red("[ERROR] Failed to generate ecosystem.config.cjs:"), err.message);
     process.exitCode = 1;
     return;
+  }
+
+  if (hasStandalone && standalonePath.startsWith(".next/standalone")) {
+    console.log("");
+    console.log(colors.yellow("[INFO] Standalone build detected. Next.js does not copy static assets into it; after each build run:"));
+    console.log(colors.cyan("  cp -r public .next/standalone/ && cp -r .next/static .next/standalone/.next/"));
+    console.log(colors.gray(`  (APP_DIR=${projectRoot} keeps the SQLite DB and uploads in the project root, outside .next/)`));
   }
 
   const shouldStart = process.argv.includes("--start");
