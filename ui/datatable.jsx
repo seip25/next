@@ -9,6 +9,11 @@ import { Pagination } from "./pagination";
 import { Skeleton } from "./skeleton";
 import { EmptyState } from "./empty-state";
 import { Spinner } from "./spinner";
+import { Dropdown } from "./dropdown";
+import { buttonClasses } from "./button";
+import { useConfirmOptional } from "./modal";
+import { useToastOptional } from "./toast";
+import Link from "next/link";
 
 /*
  * Responsive DataTable: search, column filters, sorting, pagination, row selection, CSV export.
@@ -29,6 +34,17 @@ import { Spinner } from "./spinner";
  *    exportValue: (row) => row.email,       // CSV value
  *    align: "left" | "center" | "right", width: "8rem", primary: true (card title on mobile),
  *    hideOnMobile: true, className, headerClassName }
+ *
+ * Row actions (view / edit / delete…) — rendered as a last column on desktop and as a button row on mobile cards:
+ *  rowActions={[
+ *    { label: "Ver", href: (row) => `/users/${row.id}` },                       // link (next/link)
+ *    { label: "Editar", onClick: (row) => openEditor(row) },                     // any function
+ *    { label: "Eliminar", danger: true, confirm: (row) => ({ title: `¿Eliminar ${row.name}?` }),
+ *      onClick: (row) => deleteUser(row.id), successMessage: "Usuario eliminado" }, // Server Action
+ *  ]}
+ *  Action fields: label, icon, href(row) | onClick(row), danger, variant, confirm (true | object | (row) => object),
+ *    successMessage, hidden(row), disabled(row), refresh (default true outside client mode), target.
+ *  rowActionsMode: "auto" (buttons if <= 3 actions, else "⋯" menu) | "buttons" | "icons" | "menu".
  */
 
 const DEFAULT_LABELS = {
@@ -41,6 +57,8 @@ const DEFAULT_LABELS = {
   export: "Exportar CSV",
   selected: (n) => `${n} seleccionado${n === 1 ? "" : "s"}`,
   clear: "Limpiar filtros",
+  actions: "Acciones",
+  more: "Más acciones",
 };
 
 const getValue = (row, col) => (col.accessor ? col.accessor(row) : row?.[col.key]);
@@ -123,6 +141,8 @@ export function DataTable({
   dense = false,
   striped = false,
   stickyHeader = false,
+  rowActions,
+  rowActionsMode = "auto",
   labels: labelsProp,
   className,
   caption,
@@ -241,11 +261,99 @@ export function DataTable({
   };
 
   const align = (col) => (col.align === "right" ? "text-right" : col.align === "center" ? "text-center" : "text-left");
-  const cell = (row, col) => {
+  const cell = (row, col, k) => {
+    if (col.isActions) return renderRowActions(row, k);
     const value = getValue(row, col);
     return col.render ? col.render(row, value) : value == null || value === "" ? <span className="text-muted">—</span> : String(value);
   };
   const pad = dense ? "px-3 py-1.5" : "px-4 py-3";
+
+  // ---- Row actions ----------------------------------------------------------
+  const confirm = useConfirmOptional();
+  const toast = useToastOptional();
+  const [busy, setBusy] = useState(null);
+
+  const runAction = async (action, row, k) => {
+    if (action.confirm) {
+      const opts =
+        typeof action.confirm === "function"
+          ? action.confirm(row)
+          : action.confirm === true
+            ? { title: `¿${action.label}?` }
+            : action.confirm;
+      const full = { danger: action.danger, confirmText: action.label, ...opts };
+      const ok = confirm ? await confirm(full) : window.confirm(full.title || `¿${action.label}?`);
+      if (!ok) return;
+    }
+    setBusy(`${k}:${action.label}`);
+    try {
+      const result = await action.onClick?.(row);
+      const isResult = result && typeof result === "object" && ("success" in result || "errors" in result || "message" in result);
+      if (toast && isResult) toast.fromResult(result, action.successMessage);
+      else if (toast && action.successMessage) toast.success(action.successMessage);
+      const failed = isResult && (result.success === false || result.errors?.length);
+      if (!failed && mode !== "client" && action.refresh !== false) startTransition(() => router.refresh());
+    } catch (err) {
+      if (toast) toast.error(err?.message || "Ocurrió un error");
+      else console.error(err);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const renderRowActions = (row, k, forceButtons = false) => {
+    const list = (rowActions || []).filter((a) => !a.hidden?.(row));
+    if (list.length === 0) return null;
+    const asMenu = !forceButtons && (rowActionsMode === "menu" || (rowActionsMode === "auto" && list.length > 3));
+    if (asMenu) {
+      return (
+        <Dropdown
+          trigger={<button type="button" aria-label={labels.more} className={buttonClasses({ variant: "ghost", size: "icon-sm" })}>⋯</button>}
+          items={list.map((a) => ({
+            label: a.label,
+            icon: a.icon,
+            danger: a.danger,
+            disabled: a.disabled?.(row),
+            href: a.href ? a.href(row) : undefined,
+            onClick: a.href ? undefined : () => runAction(a, row, k),
+          }))}
+        />
+      );
+    }
+    const iconsOnly = rowActionsMode === "icons" && !forceButtons;
+    return (
+      <div className={cn("flex flex-wrap items-center gap-1", forceButtons ? "justify-start" : "justify-end")}>
+        {list.map((a) => {
+          const variant = a.variant || (a.danger ? "danger-ghost" : "outline");
+          const cls = buttonClasses({ variant, size: iconsOnly && a.icon ? "icon-sm" : "xs" });
+          const content = iconsOnly && a.icon ? a.icon : <>{a.icon}{a.label}</>;
+          const disabled = a.disabled?.(row);
+          if (a.href) {
+            return (
+              <Link key={a.label} href={a.href(row)} target={a.target} aria-label={a.label} title={iconsOnly ? a.label : undefined}
+                aria-disabled={disabled || undefined} className={cls} onClick={(e) => e.stopPropagation()}>
+                {content}
+              </Link>
+            );
+          }
+          const isBusy = busy === `${k}:${a.label}`;
+          return (
+            <button key={a.label} type="button" aria-label={a.label} title={iconsOnly ? a.label : undefined}
+              disabled={disabled || isBusy} className={cls}
+              onClick={(e) => { e.stopPropagation(); runAction(a, row, k); }}>
+              {isBusy ? <Spinner size="xs" label="" /> : null}
+              {content}
+            </button>
+          );
+        })}
+      </div>
+    );
+  };
+
+  const actionsColumn = rowActions?.length
+    ? { key: "__actions", header: <span className="sr-only">{labels.actions}</span>, align: "right", searchable: false, export: false, hideOnMobile: true, isActions: true }
+    : null;
+  const allColumns = actionsColumn ? [...columns, actionsColumn] : columns;
   const primaryCol = columns.find((c) => c.primary) || columns[0];
 
   const exportCsv = () => {
@@ -354,7 +462,7 @@ export function DataTable({
                     <input type="checkbox" aria-label="Seleccionar página" checked={allOnPage} onChange={toggleAll} className="size-4 accent-primary" />
                   </th>
                 )}
-                {columns.map((col) => (
+                {allColumns.map((col) => (
                   <th
                     key={col.key ?? col.header}
                     scope="col"
@@ -383,7 +491,7 @@ export function DataTable({
                 ? Array.from({ length: Math.min(query.limit, 5) }, (_, i) => (
                     <tr key={`s${i}`}>
                       {selectable && <td className={pad} />}
-                      {columns.map((col) => (
+                      {allColumns.map((col) => (
                         <td key={col.key ?? col.header} className={pad}>
                           <Skeleton className="h-4 w-3/4" />
                         </td>
@@ -408,9 +516,9 @@ export function DataTable({
                             <input type="checkbox" aria-label="Seleccionar fila" checked={selected.has(k)} onChange={() => toggleOne(k)} className="size-4 accent-primary" />
                           </td>
                         )}
-                        {columns.map((col) => (
-                          <td key={col.key ?? col.header} className={cn(pad, align(col), col.className)}>
-                            {cell(row, col)}
+                        {allColumns.map((col) => (
+                          <td key={col.key ?? col.header} className={cn(pad, align(col), col.className)} onClick={col.isActions ? (e) => e.stopPropagation() : undefined}>
+                            {cell(row, col, k)}
                           </td>
                         ))}
                       </tr>
@@ -460,6 +568,7 @@ export function DataTable({
                           </div>
                         ))}
                     </dl>
+                    {rowActions?.length > 0 && <div className="mt-3 border-t border-border pt-3">{renderRowActions(row, k, true)}</div>}
                   </li>
                 );
               })}

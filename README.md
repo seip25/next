@@ -776,6 +776,32 @@ export default async function UsersPage({ searchParams }) {
 }
 ```
 
+### Cuántos registros muestra (valores por defecto)
+
+| Opción de `parse` | Por defecto | Qué hace |
+| --- | --- | --- |
+| `defaultLimit` | **`10`** | Filas por página cuando la URL no trae `?limit=`. |
+| `maxLimit` | **`100`** | Tope: `?limit=5000` se recorta a 100 (nadie puede volcar la tabla entera). |
+| `defaultSort` | `null` (sin `ORDER BY`) | Columna de orden si la URL no trae `?sort=`. |
+| `defaultDir` | `"asc"` | Dirección por defecto (`"asc"` / `"desc"`). |
+| `sortable` / `filterable` | `[]` | Columnas permitidas para ordenar / filtrar. Lo que no esté aquí se ignora. |
+
+Parámetros de URL que entiende:
+
+| Parámetro | Ejemplo | Resultado |
+| --- | --- | --- |
+| `q` | `?q=ana` | Búsqueda (OR entre las columnas `searchable`), máx. 200 caracteres |
+| `page` | `?page=3` | Página (mínimo 1) |
+| `limit` | `?limit=25` | Filas por página (entre 1 y `maxLimit`) |
+| `sort` + `dir` | `?sort=name&dir=desc` | Orden (solo columnas `sortable`) |
+| `f_<columna>` | `?f_role=admin` | Filtro por igualdad (solo columnas `filterable`) |
+
+Para mostrar 25 por página: `TableQuery.parse(params, { defaultLimit: 25 })`. En la `DataTable`
+el selector de "Filas" cambia `?limit=`; mantén sus opciones (`pageSizeOptions`, por defecto
+`[10, 25, 50, 100]`) por debajo de `maxLimit`, o el servidor las recortará.
+
+### Más opciones
+
 - Con un **Model**: usa su tabla y conexión, excluye soft-deleted y quita columnas `hidden`.
 - Con un **nombre de tabla**: `TableQuery.paginate("orders", query, { db, searchable: [...] })`.
 - Condición fija: `{ where: { sql: "tenant_id = ?", params: [tenantId] } }`.
@@ -911,7 +937,7 @@ import { Button, buttonClasses } from "@/ui";
 <Link href="/nuevo" className={buttonClasses({ variant: "secondary" })}>Crear</Link>
 ```
 
-Variantes: `primary`, `secondary`, `outline`, `ghost`, `danger`, `success`, `link`.
+Variantes: `primary`, `secondary`, `outline`, `ghost`, `danger`, `danger-ghost`, `danger-outline`, `success`, `link`.
 Tamaños: `xs`, `sm`, `md`, `lg`, `icon`, `icon-sm`.
 
 ### Input, Textarea, Select, Checkbox, Switch
@@ -1180,6 +1206,108 @@ export function UsersTable({ data, total, query }) {
 La página (Server Component) es el ejemplo de la sección TableQuery. Las columnas `sortable` y
 con `filter` de la tabla deben estar en `sortable`/`filterable` de `TableQuery.parse`.
 
+#### Acciones por fila (ver, editar, eliminar…)
+
+Con `rowActions` cada fila tiene sus botones o links. En escritorio van en una última columna;
+en móvil, al pie de cada tarjeta. Cada acción es un **link** (`href`) o un **botón** (`onClick`),
+y el `onClick` puede ser una Server Action:
+
+```jsx
+// src/app/admin/users/actions.js
+"use server";
+import { Auth } from "@seip/nextjs/auth";
+import User from "@/models/user";
+
+async function requireAdmin() {
+  const user = await Auth.user();
+  if (user?.role !== "admin") throw new Error("No autorizado"); // las Server Actions son endpoints públicos: valida siempre
+}
+
+export async function deleteUser(id) {
+  await requireAdmin();
+  const n = await User.delete(id);
+  return n ? { success: true, message: "Usuario eliminado" } : { success: false, message: "No existe" };
+}
+
+export async function toggleActive(id) {
+  await requireAdmin();
+  await User.update(id, { active: false });
+  return { success: true, message: "Usuario desactivado" };
+}
+```
+
+```jsx
+// src/app/admin/users/users-table.jsx
+"use client";
+import { DataTable } from "@/ui";
+import { deleteUser, toggleActive } from "./actions";
+
+// Las columnas se definen en el archivo de cliente: llevan funciones (render) que no se pueden
+// pasar como props desde un Server Component.
+const columns = [
+  { key: "name", header: "Nombre", sortable: true, primary: true },
+  { key: "email", header: "Email", sortable: true },
+  { key: "role", header: "Rol", filter: { type: "select", options: ["admin", "user"] } },
+];
+
+export function UsersTable({ data, total, query }) {
+  return (
+    <DataTable
+      mode="url"
+      data={data}
+      total={total}
+      query={query}
+      columns={columns}
+      rowActions={[
+        { label: "Ver", href: (row) => `/admin/users/${row.id}` },
+        { label: "Editar", href: (row) => `/admin/users/${row.id}/edit` },
+        {
+          label: "Desactivar",
+          onClick: (row) => toggleActive(row.id),            // Server Action → toast con su resultado
+          hidden: (row) => !row.active,                       // no se muestra en usuarios inactivos
+        },
+        {
+          label: "Eliminar",
+          danger: true,
+          confirm: (row) => ({ title: `¿Eliminar a ${row.name}?`, description: "No se puede deshacer." }),
+          onClick: (row) => deleteUser(row.id),
+          disabled: (row) => row.role === "admin",
+        },
+      ]}
+      // rowActionsMode="auto"   → botones si hay hasta 3 acciones; con más, un menú "⋯"
+    />
+  );
+}
+```
+
+Qué pasa al hacer clic en una acción con `onClick`:
+1. Si tiene `confirm`, abre el diálogo de confirmación (`<UIProvider>`; sin provider usa `window.confirm`).
+2. Muestra un spinner en ese botón mientras la promesa está pendiente.
+3. Si la función devuelve `{ success, message }` o `{ errors }` (el formato de `Validator`),
+   muestra el toast correspondiente. Con `successMessage: "..."` muestra ese texto si no devuelve nada.
+   Si lanza un error, muestra `toast.error(err.message)`.
+4. En modo `url`/`server` hace `router.refresh()` para traer los datos actualizados
+   (desactívalo con `refresh: false`).
+
+| Campo | Tipo | |
+| --- | --- | --- |
+| `label` | string | Texto (y `aria-label`). |
+| `href` | `(row) => string` | Lo convierte en link (`next/link`). `target: "_blank"` opcional. |
+| `onClick` | `(row) => any \| Promise` | Función o Server Action. |
+| `icon` | ReactNode | Ícono antes del texto (o solo ícono con `rowActionsMode="icons"`). |
+| `danger` | boolean | Estilo rojo (y botón rojo en el confirm). |
+| `variant` | variante de `Button` | Por defecto `outline` (o `danger-ghost` si `danger`). |
+| `confirm` | `true \| object \| (row) => object` | `{ title, description, confirmText, cancelText }`. |
+| `successMessage` | string | Toast si `onClick` no devuelve un resultado. |
+| `hidden` / `disabled` | `(row) => boolean` | Ocultar o deshabilitar por fila. |
+| `refresh` | boolean | `router.refresh()` al terminar (por defecto `true` fuera del modo cliente). |
+
+`rowActionsMode`: `"auto"` (por defecto), `"buttons"`, `"icons"` (botones solo con ícono y tooltip
+nativo) o `"menu"` (todo dentro de un menú "⋯"). En móvil siempre se muestran como botones.
+
+Si necesitas algo más libre, cualquier columna puede tener su propio `render` con `Button`,
+`Dropdown` o links: `{ key: "acciones", header: "", searchable: false, export: false, render: (row) => … }`.
+
 **Modo server** (controlado, para traer datos desde una API o Server Action):
 
 ```jsx
@@ -1197,6 +1325,9 @@ const [state, setState] = useState({ data: [], total: 0, loading: true });
   columns={columns}
 />
 ```
+
+Props por defecto: `pageSize={10}` (modo cliente; en modo `url` manda el `limit` del `query`),
+`pageSizeOptions={[10, 25, 50, 100]}`, `searchable={true}`, `mode="client"`, `rowKey="id"`.
 
 Otras props: `dense`, `striped`, `stickyHeader`, `caption`, `emptyState={<EmptyState …/>}`,
 `onSelectionChange(rows)`, `searchable={false}` y `labels` para traducir textos:
@@ -1544,6 +1675,8 @@ Notas para Next 16:
 - `npx seip make:ui`: componentes con Tailwind v4 (DataTable, Toast, Snackbar, Modal, Confirm,
   Drawer, Tabs, Dropdown, Pagination, Carousel, FileUpload, Input, Select, Checkbox, Switch, Card,
   StatCard, Badge, Alert, Tooltip, Accordion, Skeleton, Spinner, EmptyState).
+- `DataTable`: `rowActions` (ver / editar / eliminar como links o botones, con confirmación,
+  toast del resultado y refresco automático).
 
 ---
 

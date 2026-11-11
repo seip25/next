@@ -7,6 +7,8 @@ const variants = {
   outline: "border border-border bg-transparent text-fg hover:bg-surface-2",
   ghost: "bg-transparent text-fg hover:bg-surface-2",
   danger: "bg-danger text-white hover:bg-danger/90 shadow-sm",
+  "danger-ghost": "bg-transparent text-danger hover:bg-danger/10",
+  "danger-outline": "border border-danger/40 bg-transparent text-danger hover:bg-danger/10",
   success: "bg-success text-white hover:bg-success/90 shadow-sm",
   link: "bg-transparent text-primary underline-offset-4 hover:underline !px-0 !h-auto",
 };
@@ -38,7 +40,7 @@ export function buttonClasses({ variant = "primary", size = "md", block = false,
 
 /**
  * Button. Server-safe (no hooks): works in Server Components and in <form action={serverAction}>.
- * @param {{variant?: "primary"|"secondary"|"outline"|"ghost"|"danger"|"success"|"link", size?: "xs"|"sm"|"md"|"lg"|"icon"|"icon-sm", block?: boolean, loading?: boolean, leftIcon?: any, rightIcon?: any}} props
+ * @param {{variant?: "primary"|"secondary"|"outline"|"ghost"|"danger"|"danger-ghost"|"danger-outline"|"success"|"link", size?: "xs"|"sm"|"md"|"lg"|"icon"|"icon-sm", block?: boolean, loading?: boolean, leftIcon?: any, rightIcon?: any}} props
  */
 export function Button({
   variant,

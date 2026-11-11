@@ -208,6 +208,11 @@ export function ToastProvider({ position = "bottom-right", duration = 4000, max 
   );
 }
 
+/** Like useToast() but returns null (instead of throwing) when there is no provider. */
+export function useToastOptional() {
+  return useContext(ToastContext)?.toast ?? null;
+}
+
 export function useToast() {
   const ctx = useContext(ToastContext);
   if (!ctx) throw new Error("useToast() requires <ToastProvider> or <UIProvider> in a parent layout.");

@@ -135,6 +135,11 @@ export function ConfirmProvider({ children }) {
  * const confirm = useConfirm();
  * if (await confirm({ title: "¿Eliminar usuario?", description: "No se puede deshacer.", danger: true })) { ... }
  */
+/** Like useConfirm() but returns null (instead of throwing) when there is no provider. */
+export function useConfirmOptional() {
+  return useContext(ConfirmContext);
+}
+
 export function useConfirm() {
   const ctx = useContext(ConfirmContext);
   if (!ctx) throw new Error("useConfirm() requires <ConfirmProvider> or <UIProvider> in a parent layout.");

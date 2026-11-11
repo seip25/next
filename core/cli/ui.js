@@ -32,7 +32,7 @@ export const UI_COMPONENTS = {
   provider: { file: "provider.jsx", deps: ["toast", "modal"], client: true, description: "UIProvider (toasts + snackbar + confirm)" },
   datatable: {
     file: "datatable.jsx",
-    deps: ["utils", "input", "select", "button", "pagination", "skeleton", "empty-state", "spinner"],
+    deps: ["utils", "input", "select", "button", "pagination", "skeleton", "empty-state", "spinner", "dropdown", "modal", "toast"],
     client: true,
     description: "DataTable responsive: búsqueda, filtros, orden, paginación, selección, CSV",
   },
