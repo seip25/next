@@ -58,6 +58,10 @@
       "types": "./core/ws.d.ts",
       "default": "./core/ws.js"
     },
+    "./table": {
+      "types": "./core/table.d.ts",
+      "default": "./core/table.js"
+    },
     "./colors": {
       "default": "./core/util/colors.js"
     },
@@ -106,6 +110,7 @@
   "files": [
     "bin",
     "core",
+    "ui",
     "index.js",
     "index.d.ts",
     "README.md",

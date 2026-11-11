@@ -11,6 +11,7 @@ import { Seo } from "./core/seo.js";
 import { WebSocketManager } from "./core/ws.js";
 import { colors } from "./core/util/colors.js";
 import { registerModule } from "./core/util/optional.js";
+import { TableQuery } from "./core/table.js";
 
 export {
   Database,
@@ -30,6 +31,7 @@ export {
   WebSocketManager,
   colors,
   registerModule,
+  TableQuery,
 };
 
 export default {
@@ -50,4 +52,5 @@ export default {
   WebSocketManager,
   colors,
   registerModule,
+  TableQuery,
 };

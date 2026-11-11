@@ -1,0 +1,105 @@
+/*
+ * @seip/nextjs UI — theme tokens for Tailwind CSS v4.
+ * Import it AFTER tailwindcss in your global stylesheet:
+ *
+ *   @import "tailwindcss";
+ *   @import "../ui/theme.css";
+ *
+ * Change the --ui-* variables to rebrand every component at once.
+ * Dark mode: follows the OS by default; force it with <html class="dark"> or <html class="light">.
+ */
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --color-surface: var(--ui-surface);
+  --color-surface-2: var(--ui-surface-2);
+  --color-fg: var(--ui-fg);
+  --color-muted: var(--ui-muted);
+  --color-border: var(--ui-border);
+  --color-primary: var(--ui-primary);
+  --color-primary-fg: var(--ui-primary-fg);
+  --color-danger: var(--ui-danger);
+  --color-success: var(--ui-success);
+  --color-warning: var(--ui-warning);
+  --color-info: var(--ui-info);
+  --color-ring: var(--ui-ring);
+  --radius-ui: var(--ui-radius);
+
+  --animate-ui-fade-in: ui-fade-in 150ms ease-out;
+  --animate-ui-pop-in: ui-pop-in 180ms cubic-bezier(0.2, 0.9, 0.3, 1.2);
+  --animate-ui-slide-up: ui-slide-up 200ms ease-out;
+  --animate-ui-slide-left: ui-slide-left 220ms ease-out;
+  --animate-ui-slide-right: ui-slide-right 220ms ease-out;
+  --animate-ui-slide-down: ui-slide-down 220ms ease-out;
+}
+
+:root {
+  --ui-surface: #ffffff;
+  --ui-surface-2: #f4f4f5;
+  --ui-fg: #18181b;
+  --ui-muted: #71717a;
+  --ui-border: #e4e4e7;
+  --ui-primary: #4f46e5;
+  --ui-primary-fg: #ffffff;
+  --ui-danger: #dc2626;
+  --ui-success: #16a34a;
+  --ui-warning: #d97706;
+  --ui-info: #0284c7;
+  --ui-ring: #6366f1;
+  --ui-radius: 0.625rem;
+}
+
+.dark {
+  --ui-surface: #18181b;
+  --ui-surface-2: #27272a;
+  --ui-fg: #fafafa;
+  --ui-muted: #a1a1aa;
+  --ui-border: #3f3f46;
+  --ui-primary: #818cf8;
+  --ui-primary-fg: #111827;
+  --ui-danger: #f87171;
+  --ui-success: #4ade80;
+  --ui-warning: #fbbf24;
+  --ui-info: #38bdf8;
+  --ui-ring: #818cf8;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) {
+    --ui-surface: #18181b;
+    --ui-surface-2: #27272a;
+    --ui-fg: #fafafa;
+    --ui-muted: #a1a1aa;
+    --ui-border: #3f3f46;
+    --ui-primary: #818cf8;
+    --ui-primary-fg: #111827;
+    --ui-danger: #f87171;
+    --ui-success: #4ade80;
+    --ui-warning: #fbbf24;
+    --ui-info: #38bdf8;
+    --ui-ring: #818cf8;
+  }
+}
+
+@keyframes ui-fade-in { from { opacity: 0 } to { opacity: 1 } }
+@keyframes ui-pop-in { from { opacity: 0; transform: scale(0.96) } to { opacity: 1; transform: scale(1) } }
+@keyframes ui-slide-up { from { opacity: 0; transform: translateY(12px) } to { opacity: 1; transform: translateY(0) } }
+@keyframes ui-slide-down { from { transform: translateY(-100%) } to { transform: translateY(0) } }
+@keyframes ui-slide-left { from { transform: translateX(100%) } to { transform: translateX(0) } }
+@keyframes ui-slide-right { from { transform: translateX(-100%) } to { transform: translateX(0) } }
+
+@layer base {
+  body {
+    background-color: var(--color-surface);
+    color: var(--color-fg);
+  }
+  dialog::backdrop {
+    background: rgb(0 0 0 / 0.5);
+    backdrop-filter: blur(2px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [class*="animate-ui-"] { animation: none !important; }
+}

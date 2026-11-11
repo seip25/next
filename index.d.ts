@@ -254,6 +254,58 @@ export class Upload {
   static serve(relativePath: string | string[], options?: { folder?: string; cacheControl?: string }): Promise<Response>;
 }
 
+export interface TableQueryState {
+  page: number;
+  limit: number;
+  search: string;
+  sort: string | null;
+  dir: "asc" | "desc";
+  filters: Record<string, string>;
+}
+
+export class TableQuery {
+  /** Parses ?q=&page=&limit=&sort=&dir=&f_<col>= against your whitelists. */
+  static parse(
+    searchParams: URLSearchParams | Record<string, string | string[] | undefined>,
+    config?: {
+      sortable?: string[];
+      filterable?: string[];
+      defaultSort?: string;
+      defaultDir?: "asc" | "desc";
+      defaultLimit?: number;
+      maxLimit?: number;
+    }
+  ): TableQueryState;
+  static build(
+    query: Partial<TableQueryState>,
+    options: {
+      table: string;
+      select?: string;
+      searchable?: string[];
+      sortable?: string[];
+      filterable?: string[];
+      where?: { sql: string; params?: any[] };
+      dialect?: string;
+      softDelete?: boolean;
+    }
+  ): { sql: string; params: any[] };
+  static paginate<T = any>(
+    source: typeof Model | string,
+    query: Partial<TableQueryState>,
+    options?: {
+      searchable?: string[];
+      sortable?: string[];
+      filterable?: string[];
+      select?: string;
+      where?: { sql: string; params?: any[] };
+      db?: Database;
+      maxLimit?: number;
+      withDeleted?: boolean;
+      withHidden?: boolean;
+    }
+  ): Promise<PaginateResult<T> & { query: Partial<TableQueryState> }>;
+}
+
 export class Seo {
   static registerRoute(routePath: string, languages?: string[]): void;
   static disallow(routes: string | string[]): void;
@@ -321,6 +373,7 @@ declare const _default: {
   WebSocketManager: typeof WebSocketManager;
   colors: typeof colors;
   registerModule: typeof registerModule;
+  TableQuery: typeof TableQuery;
 };
 
 export default _default;
