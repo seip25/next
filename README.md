@@ -22,7 +22,7 @@
   - `make:migration` y `migrate`: Comparador automático de esquemas de modelos contra la BD real, con `Up`, `Down`, lotes y transacciones.
   - `make:ecosystem`: Genera `ecosystem.config.cjs` para PM2 en VPS usando `.env`.
   - `nginx:conf`: Genera configuración de Nginx para VPS con SSL Certbot, compresión Gzip, límite de 100M y caché inmutable de assets.
-  - `make:desktop`: Scaffold para Nextron / Electron con empaquetado para Windows (NSIS y Portable), macOS y Linux.
+  - `make:desktop`: Scaffold de Electron (servidor standalone) con empaquetado para Windows (NSIS y Portable), macOS y Linux.
 
 ---
 
@@ -42,6 +42,23 @@ npm install ws             # Si usas el servidor WebSocket independiente
 npm install multer         # Si usas Upload.disk() / Upload.storage()
 npm install bcrypt         # Solo si necesitas verificar hashes bcrypt existentes
 ```
+
+> **Next.js 16 / Turbopack:** no hace falta `serverExternalPackages: ["@seip/nextjs"]`
+> (desde 0.0.4). Los paquetes opcionales se cargan en runtime sin que Turbopack intente
+> resolverlos, así que el build funciona aunque `bcrypt`, `pg`, `mysql2`, `multer`… no estén
+> instalados. Si lo tenías en `next.config`, **quítalo**: con el paquete externo,
+> `next/headers` no comparte el contexto de la request y `Auth.login()` no puede escribir la cookie.
+>
+> **`output: "standalone"` (VPS / Desktop) con un driver opcional:** como el import es
+> dinámico, Next no copia ese paquete a `.next/standalone`. Impórtalo tú y regístralo una vez:
+> ```javascript
+> // src/lib/db.js
+> import pg from "pg";                       // o: import * as mysql from "mysql2/promise";
+> import { registerModule } from "@seip/nextjs";
+> registerModule("pg", pg);                  // o: registerModule("mysql2/promise", mysql);
+> ```
+> El driver por defecto (`node:sqlite`) y el hash por defecto (`scrypt`) son nativos de Node:
+> no necesitan nada de esto.
 
 > **Tip:** importa por subruta (`@seip/nextjs/auth`, `@seip/nextjs/ratelimit`,
 > `@seip/nextjs/database`…) en `proxy.js`: así no se cargan módulos que no usas.
@@ -131,6 +148,10 @@ export async function proxy(request) {
 ```
 
 - El token se lee de la cookie `auth` o de `Authorization: Bearer <token>` (clientes de API).
+  `Auth.user()` acepta lo mismo, así que una request con Bearer que pasa el proxy no recibe 401 en la ruta.
+- `Auth.login()` / `Auth.logout()` usan `cookies()` de `next/headers` si no pasas `cookieStore`.
+  Solo pueden escribir cookies en **Server Actions y Route Handlers** (no en Server Components).
+  Si no pueden, ahora avisan con `console.warn` y `login()` devuelve `cookieSet: false`.
 - `Auth.logout()` revoca la sesión en el servidor. La lista de sesiones revocadas se comparte
   entre `proxy.js` y las rutas, y en producción se guarda en
   `database/.revoked-sessions.json` para sobrevivir a `pm2 restart`
@@ -298,7 +319,7 @@ npx @seip/nextjs nginx:conf midominio.com --ssl  # Config HTTPS final (con el ce
                                                  # --www / --no-www / --with-ws
 
 # Aplicación de Escritorio (Desktop)
-npx @seip/nextjs make:desktop           # Genera scaffold de Nextron / Electron
+npx @seip/nextjs make:desktop           # Genera scaffold de Electron (Win, Mac, Linux)
 ```
 
 **Despliegue con PM2 (1 instancia):** `ecosystem.config.cjs` lee `.env` cuando PM2 lo carga
@@ -321,8 +342,10 @@ y registradas en `_seip_migrations` como cualquier otra migración.
      output: "standalone",
    };
    ```
-2. Ejecuta `npx @seip/next make:desktop`.
-3. Compila el servidor web: `npm run build`.
+2. Ejecuta `npx @seip/nextjs make:desktop`.
+3. Genera la plantilla de BD y compila: `npx seip migrate && npm run build`.
+   `database/app.db` se empaqueta como plantilla y se copia a la carpeta de datos del usuario
+   (`app.getPath("userData")`) en el primer arranque.
 4. Ve a la carpeta generada y construye el instalador:
    ```bash
    cd desktop
@@ -333,6 +356,15 @@ y registradas en `_seip_migrations` como cualquier otra migración.
    npm run build:linux      # Linux (AppImage / tar.gz)
    npm run build:all        # Todas las plataformas
    ```
+
+Notas del modo desktop:
+- Usa Electron + electron-builder directamente (sin Nextron: la UI es el servidor standalone).
+- `npm run dev` dentro de `desktop/` abre `http://localhost:3000` (levanta antes `npm run dev` en la raíz);
+  `npm start` prueba el servidor empaquetado sin generar instalador.
+- El servidor escucha solo en `127.0.0.1` en un puerto libre, y cada instalación genera su propio
+  `JWT_SECRET` en userData (no se incluye en el instalador).
+- Evita addons nativos compilados para Node (p. ej. `better-sqlite3`): Electron tiene otro ABI.
+  Los defaults (`node:sqlite` + `scrypt`) no usan ninguno.
 
 ---
 

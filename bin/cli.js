@@ -44,7 +44,7 @@ function showHelp() {
   console.log(colors.green("  seed [--force]            ") + colors.gray("Ejecuta los seeds pendientes (--force re-ejecuta todos)"));
   console.log(colors.green("  make:ecosystem            ") + colors.gray("Genera ecosystem.config.cjs para PM2 en VPS"));
   console.log(colors.green("  nginx:conf [domain]       ") + colors.gray("Genera configuración Nginx y comandos Certbot"));
-  console.log(colors.green("  make:desktop              ") + colors.gray("Scaffold de Nextron/Electron (Win, Mac, Linux, Portable)"));
+  console.log(colors.green("  make:desktop              ") + colors.gray("Scaffold de Electron (Win, Mac, Linux, Portable)"));
   console.log(colors.green("  make:seo                  ") + colors.gray("Genera sitemap.xml y robots.txt con filtro"));
   console.log(colors.green("  ws:start [port] [--auth]   ") + colors.gray("Inicia el servidor WebSocket independiente (--auth exige token)"));
   console.log("");

@@ -1,12 +1,11 @@
 import crypto from "node:crypto";
+import { importOptionalDefault } from "./util/optional.js";
 
 /** bcrypt is optional and loaded lazily (only when a bcrypt hash/driver is used). */
 let bcryptPromise = null;
 function loadBcrypt() {
   if (!bcryptPromise) {
-    bcryptPromise = import("bcrypt")
-      .then((mod) => mod.default || mod)
-      .catch(() => null);
+    bcryptPromise = importOptionalDefault("bcrypt");
   }
   return bcryptPromise;
 }

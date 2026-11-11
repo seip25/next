@@ -527,3 +527,61 @@ test("WebSocket: standalone mode enforces auth and rooms never fall back to ever
 test.after(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------------------
+// 0.0.4: Next.js 16 / Turbopack integration
+// ---------------------------------------------------------------------------
+
+test("Bundlers: optional dependencies are never imported with a literal specifier", () => {
+  const coreDir = path.join(import.meta.dirname, "..", "core");
+  const files = fs.readdirSync(coreDir).filter((f) => f.endsWith(".js"));
+  for (const file of files) {
+    const src = fs.readFileSync(path.join(coreDir, file), "utf8");
+    for (const dep of ["bcrypt", "pg", "mysql2", "mysql2/promise", "better-sqlite3", "multer", "ws"]) {
+      assert.ok(
+        !src.includes(`import("${dep}")`) && !src.includes(`from "${dep}"`),
+        `${file} imports optional '${dep}' literally (Turbopack would fail when it is not installed)`
+      );
+    }
+  }
+});
+
+test("SQLite: rows are plain objects (serializable to Client Components)", async () => {
+  const db = await memoryDb();
+  await db.query("CREATE TABLE p (id INTEGER PRIMARY KEY, name TEXT)");
+  await db.query("INSERT INTO p (name) VALUES (?)", ["a"]);
+  const rows = await db.query("SELECT * FROM p");
+  assert.equal(Object.getPrototypeOf(rows[0]), Object.prototype);
+  const row = await db.query("SELECT * FROM p WHERE id = ?", [1], { return_row: true });
+  assert.equal(Object.getPrototypeOf(row), Object.prototype);
+  assert.deepEqual(row, { id: 1, name: "a" });
+});
+
+test("Auth.login warns (instead of failing silently) when no cookie store is available", async () => {
+  const warnings = [];
+  const { warn } = console;
+  console.warn = (msg) => warnings.push(String(msg));
+  try {
+    const result = await Auth.login({ id: 7 });
+    assert.equal(result.cookieSet, false);
+    assert.ok(result.token);
+    assert.ok(warnings.some((w) => w.includes("Auth.login()")));
+  } finally {
+    console.warn = warn;
+  }
+});
+
+test("Auth.login reports cookieSet=true with an explicit cookie store", async () => {
+  const jar = new Map();
+  const store = { set: (c) => jar.set(c.name, c), get: (k) => jar.get(k) };
+  const { cookieSet, token } = await Auth.login({ id: 8 }, { cookieStore: store });
+  assert.equal(cookieSet, true);
+  assert.equal((await Auth.user(store)).id, 8);
+  assert.equal(jar.get("auth").value, token);
+});
+
+test("Auth.user(request) accepts Authorization: Bearer like handleProxy", async () => {
+  const { token } = await Auth.login({ id: 9 }, { cookieStore: { set() {} } });
+  const req = new Request("http://localhost/api/x", { headers: { authorization: `Bearer ${token}` } });
+  assert.equal((await Auth.user(req)).id, 9);
+});

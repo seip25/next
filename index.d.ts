@@ -115,7 +115,7 @@ export class Auth {
       cookieStore?: any;
       secret?: string;
     }
-  ): Promise<{ token: string; cookie: any }>;
+  ): Promise<{ token: string; cookie: any; cookieSet: boolean }>;
   static logout(options?: { cookieKey?: string; cookieStore?: any }): Promise<boolean>;
 }
 
@@ -204,6 +204,9 @@ export class IA {
 }
 
 export function escapeXss(value: any): string;
+
+/** Registers an already-imported optional dependency (bcrypt, pg, mysql2/promise, better-sqlite3, multer, ws). */
+export function registerModule(name: string, mod: any): void;
 
 export class Validator {
   constructor(schema?: Record<string, any>, lang_default?: string, messages?: any);
@@ -317,6 +320,7 @@ declare const _default: {
   Seo: typeof Seo;
   WebSocketManager: typeof WebSocketManager;
   colors: typeof colors;
+  registerModule: typeof registerModule;
 };
 
 export default _default;

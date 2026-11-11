@@ -132,6 +132,54 @@ function tokenExpiryMs(token) {
   }
 }
 
+const warnedContext = new Set();
+
+/**
+ * Warns once per operation when next/headers has no request context. Without this, a login
+ * in a context where cookies() is unavailable answered 200 without a Set-Cookie and no log.
+ * @param {string} op
+ * @param {Error} [err]
+ */
+function warnNoRequestContext(op, err) {
+  if (warnedContext.has(op)) return;
+  warnedContext.add(op);
+  console.warn(
+    `[AUTH WARNING] Auth.${op}(): next/headers cookies() is not available here, so the auth cookie ` +
+      `could not be ${op === "user" ? "read" : "written"}${err?.message ? ` (${err.message})` : ""}. ` +
+      `Pass it explicitly: Auth.${op}(${op === "user" ? "await cookies()" : "..., { cookieStore: await cookies() }"}) ` +
+      `from a Server Action or Route Handler. If @seip/nextjs is listed in serverExternalPackages, ` +
+      `remove it (it is no longer needed since 0.0.4) or always pass cookieStore.`
+  );
+}
+
+/** @returns {Promise<any|null>} next/headers cookie store for the current request, or null. */
+async function requestCookieStore(op) {
+  try {
+    const { cookies } = await import("next/headers");
+    return await cookies();
+  } catch (err) {
+    warnNoRequestContext(op, err);
+    return null;
+  }
+}
+
+/** Bearer token from next/headers headers() (silent: absence of a request is not an error here). */
+async function requestBearerToken() {
+  try {
+    const { headers } = await import("next/headers");
+    return bearerFrom(await headers());
+  } catch {
+    return null;
+  }
+}
+
+/** @param {{get: Function}} [headerStore] */
+function bearerFrom(headerStore) {
+  const auth = headerStore && typeof headerStore.get === "function" ? headerStore.get("authorization") : null;
+  if (auth && /^Bearer\s+/i.test(auth)) return auth.replace(/^Bearer\s+/i, "").trim() || null;
+  return null;
+}
+
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -149,6 +197,25 @@ function parseDuration(duration) {
   const unit = match[2].toLowerCase();
   const factors = { s: 1, m: 60, h: 3600, d: 86400, w: 604800 };
   return val * factors[unit];
+}
+
+/**
+ * Writes the auth cookie on the given store or on next/headers cookies().
+ * cookies().set() throws in Server Components (read-only) or without request context:
+ * that is reported with console.warn instead of being swallowed.
+ * @returns {Promise<boolean>} true when the cookie was written.
+ */
+async function writeCookie(op, cookieStore, cookieOptions) {
+  const store =
+    cookieStore && typeof cookieStore.set === "function" ? cookieStore : await requestCookieStore(op);
+  if (!store) return false;
+  try {
+    await store.set(cookieOptions);
+    return true;
+  } catch (err) {
+    warnNoRequestContext(op, err);
+    return false;
+  }
 }
 
 /**
@@ -357,31 +424,33 @@ class Auth {
 
     if (cookiesOrRequest) {
       if (typeof cookiesOrRequest.get === "function") {
+        // next/headers cookies() store (or NextRequest.cookies)
         const item = await cookiesOrRequest.get(cookieKey);
         token = item?.value || (typeof item === "string" ? item : null);
+        // proxy.js accepts "Authorization: Bearer"; mirror it so API clients do not get a 401 here.
+        if (!token) token = await requestBearerToken();
       } else if (cookiesOrRequest.headers?.get) {
-        const cookieHeader = cookiesOrRequest.headers.get("cookie") || "";
-        const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${escapeRegExp(cookieKey)}=([^;]+)`));
-        if (match) {
-          try {
-            token = decodeURIComponent(match[1]);
-          } catch {
-            token = null;
-          }
+        // Request / NextRequest
+        if (cookiesOrRequest.cookies?.get) {
+          token = cookiesOrRequest.cookies.get(cookieKey)?.value || null;
         }
         if (!token) {
-          const auth = cookiesOrRequest.headers.get("authorization");
-          if (auth && auth.startsWith("Bearer ")) token = auth.slice(7).trim();
+          const cookieHeader = cookiesOrRequest.headers.get("cookie") || "";
+          const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${escapeRegExp(cookieKey)}=([^;]+)`));
+          if (match) {
+            try {
+              token = decodeURIComponent(match[1]);
+            } catch {
+              token = null;
+            }
+          }
         }
+        if (!token) token = bearerFrom(cookiesOrRequest.headers);
       }
     } else {
-      try {
-        const { cookies } = await import("next/headers");
-        const cookieStore = await cookies();
-        token = cookieStore.get(cookieKey)?.value;
-      } catch {
-        // Fallback when outside next/headers request context
-      }
+      const store = await requestCookieStore("user");
+      token = store?.get(cookieKey)?.value || null;
+      if (!token) token = await requestBearerToken();
     }
 
     return token ? this.verifyToken(token) : null;
@@ -417,17 +486,9 @@ class Auth {
       maxAge: ttlSeconds,
     };
 
-    if (cookieStore && typeof cookieStore.set === "function") {
-      await cookieStore.set(cookieOptions);
-    } else {
-      try {
-        const { cookies } = await import("next/headers");
-        const store = await cookies();
-        store.set(cookieOptions);
-      } catch {}
-    }
+    const cookieSet = await writeCookie("login", cookieStore, cookieOptions);
 
-    return { token, cookie: cookieOptions };
+    return { token, cookie: cookieOptions, cookieSet };
   }
 
   /**
@@ -450,7 +511,7 @@ class Auth {
   /**
    * Logs out user and revokes session.
    * @param {Object} [options={}]
-   * @returns {Promise<boolean>}
+   * @returns {Promise<boolean>} false when the cookie could not be cleared (a warning is logged).
    */
   static async logout(options = {}) {
     const { cookieKey = "auth", cookieStore = null } = options;
@@ -462,9 +523,8 @@ class Auth {
         const item = await cookieStore.get(cookieKey);
         token = item?.value || (typeof item === "string" ? item : null);
       } else {
-        const { cookies } = await import("next/headers");
-        const store = await cookies();
-        token = store.get(cookieKey)?.value;
+        const store = await requestCookieStore("logout");
+        token = store?.get(cookieKey)?.value || null;
       }
       if (token) this.revoke(token);
     } catch {
@@ -478,17 +538,7 @@ class Auth {
       maxAge: 0,
     };
 
-    if (cookieStore && typeof cookieStore.set === "function") {
-      await cookieStore.set(cookieOptions);
-    } else {
-      try {
-        const { cookies } = await import("next/headers");
-        const store = await cookies();
-        store.set(cookieOptions);
-      } catch {}
-    }
-
-    return true;
+    return writeCookie("logout", cookieStore, cookieOptions);
   }
 }
 
