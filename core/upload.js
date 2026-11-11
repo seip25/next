@@ -5,10 +5,9 @@ import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import Config from "./config.js";
 
-let multer = null;
-try {
-  multer = (await import("multer")).default || (await import("multer"));
-} catch {}
+import { importOptionalDefault } from "./util/optional.js";
+
+const multer = await importOptionalDefault("multer");
 
 /** Canonical, safe extension per MIME type. Prevents storing uploads under executable extensions. */
 const MIME_EXTENSIONS = {

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import Config from "./config.js";
+import { importOptional, importOptionalDefault } from "./util/optional.js";
 
 /**
  * Normalizes any supported DB_TYPE alias ("pg", "mariadb", "better-sqlite"…)
@@ -68,35 +69,25 @@ async function loadSqliteDriver() {
     testDb.close();
     return { source: "node:sqlite", DatabaseSync };
   } catch {
-    try {
-      const mod = await import("better-sqlite3");
-      return { source: "better-sqlite3", BetterSqlite: mod.default || mod };
-    } catch {
-      console.error(
-        "[DATABASE] No SQLite driver found. Node.js 22.18+ provides native 'node:sqlite', or install 'better-sqlite3'."
-      );
-      return null;
-    }
+    const BetterSqlite = await importOptionalDefault("better-sqlite3");
+    if (BetterSqlite) return { source: "better-sqlite3", BetterSqlite };
+    console.error(
+      "[DATABASE] No SQLite driver found. Node.js 22.13+ provides native 'node:sqlite', or install 'better-sqlite3'."
+    );
+    return null;
   }
 }
 
 async function loadDriverModule(type) {
   if (type === "postgres") {
-    try {
-      const mod = await import("pg");
-      return mod.default || mod;
-    } catch {
-      console.error("[DATABASE ERROR] 'pg' package is not installed. Run 'npm install pg'.");
-      return null;
-    }
+    const pg = await importOptionalDefault("pg");
+    if (!pg) console.error("[DATABASE ERROR] 'pg' package is not installed. Run 'npm install pg'.");
+    return pg;
   }
   if (type === "mysql") {
-    try {
-      return await import("mysql2/promise");
-    } catch {
-      console.error("[DATABASE ERROR] 'mysql2' package is not installed. Run 'npm install mysql2'.");
-      return null;
-    }
+    const mysql = await importOptional("mysql2/promise");
+    if (!mysql) console.error("[DATABASE ERROR] 'mysql2' package is not installed. Run 'npm install mysql2'.");
+    return mysql;
   }
   if (type === "sqlite") return loadSqliteDriver();
   return null;
@@ -109,6 +100,17 @@ async function loadDriverModule(type) {
 function loadDriver(type) {
   if (!driverCache.has(type)) driverCache.set(type, loadDriverModule(type));
   return driverCache.get(type);
+}
+
+/**
+ * node:sqlite returns rows with a null prototype ([Object: null prototype]).
+ * React refuses to pass those to Client Components ("Classes or null prototypes are not supported"),
+ * so every SQLite row is copied into a plain object.
+ * @param {object} row
+ * @returns {object}
+ */
+function toPlainRow(row) {
+  return row && typeof row === "object" && Object.getPrototypeOf(row) !== Object.prototype ? { ...row } : row;
 }
 
 /**
@@ -610,9 +612,9 @@ class Database {
     if (kind.isSelect || kind.hasReturning) {
       if (queryOptions.return_row) {
         const row = stmt.get(...params);
-        return row || null;
+        return row ? toPlainRow(row) : null;
       }
-      return stmt.all(...params);
+      return stmt.all(...params).map(toPlainRow);
     }
     const info = stmt.run(...params);
     if (kind.isInsert) return Number(info.lastInsertRowid);

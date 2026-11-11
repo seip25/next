@@ -527,3 +527,134 @@ test("WebSocket: standalone mode enforces auth and rooms never fall back to ever
 test.after(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------------------
+// 0.0.4: Next.js 16 / Turbopack integration
+// ---------------------------------------------------------------------------
+
+test("Bundlers: optional dependencies are never imported with a literal specifier", () => {
+  const coreDir = path.join(import.meta.dirname, "..", "core");
+  const files = fs.readdirSync(coreDir).filter((f) => f.endsWith(".js"));
+  for (const file of files) {
+    const src = fs.readFileSync(path.join(coreDir, file), "utf8");
+    for (const dep of ["bcrypt", "pg", "mysql2", "mysql2/promise", "better-sqlite3", "multer", "ws"]) {
+      assert.ok(
+        !src.includes(`import("${dep}")`) && !src.includes(`from "${dep}"`),
+        `${file} imports optional '${dep}' literally (Turbopack would fail when it is not installed)`
+      );
+    }
+  }
+});
+
+test("SQLite: rows are plain objects (serializable to Client Components)", async () => {
+  const db = await memoryDb();
+  await db.query("CREATE TABLE p (id INTEGER PRIMARY KEY, name TEXT)");
+  await db.query("INSERT INTO p (name) VALUES (?)", ["a"]);
+  const rows = await db.query("SELECT * FROM p");
+  assert.equal(Object.getPrototypeOf(rows[0]), Object.prototype);
+  const row = await db.query("SELECT * FROM p WHERE id = ?", [1], { return_row: true });
+  assert.equal(Object.getPrototypeOf(row), Object.prototype);
+  assert.deepEqual(row, { id: 1, name: "a" });
+});
+
+test("Auth.login warns (instead of failing silently) when no cookie store is available", async () => {
+  const warnings = [];
+  const { warn } = console;
+  console.warn = (msg) => warnings.push(String(msg));
+  try {
+    const result = await Auth.login({ id: 7 });
+    assert.equal(result.cookieSet, false);
+    assert.ok(result.token);
+    assert.ok(warnings.some((w) => w.includes("Auth.login()")));
+  } finally {
+    console.warn = warn;
+  }
+});
+
+test("Auth.login reports cookieSet=true with an explicit cookie store", async () => {
+  const jar = new Map();
+  const store = { set: (c) => jar.set(c.name, c), get: (k) => jar.get(k) };
+  const { cookieSet, token } = await Auth.login({ id: 8 }, { cookieStore: store });
+  assert.equal(cookieSet, true);
+  assert.equal((await Auth.user(store)).id, 8);
+  assert.equal(jar.get("auth").value, token);
+});
+
+test("Auth.user(request) accepts Authorization: Bearer like handleProxy", async () => {
+  const { token } = await Auth.login({ id: 9 }, { cookieStore: { set() {} } });
+  const req = new Request("http://localhost/api/x", { headers: { authorization: `Bearer ${token}` } });
+  assert.equal((await Auth.user(req)).id, 9);
+});
+
+// ---------------------------------------------------------------------------
+// TableQuery + make:ui
+// ---------------------------------------------------------------------------
+
+test("TableQuery.parse only accepts whitelisted columns", async () => {
+  const { TableQuery } = await import("../index.js");
+  const q = TableQuery.parse(
+    new URLSearchParams("q=ana&page=2&limit=5000&sort=password&dir=desc&f_role=admin&f_secret=x"),
+    { sortable: ["name"], filterable: ["role"], maxLimit: 50 }
+  );
+  assert.deepEqual(q, { page: 2, limit: 50, search: "ana", sort: null, dir: "desc", filters: { role: "admin" } });
+  const q2 = TableQuery.parse({ sort: "name", dir: "DROP" }, { sortable: ["name"] });
+  assert.equal(q2.sort, "name");
+  assert.equal(q2.dir, "asc");
+});
+
+test("TableQuery.paginate: search (OR), filters, sort and pagination on SQLite", async () => {
+  const { TableQuery } = await import("../index.js");
+  const db = await memoryDb();
+  await db.query("CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, email TEXT, role TEXT)");
+  const rows = [
+    ["Ana", "ana@x.com", "admin"],
+    ["Bruno", "bruno@x.com", "user"],
+    ["Carla", "carla@ana.org", "user"],
+    ["Dario", "dario@x.com", "user"],
+    ["100%_real", "p@x.com", "user"],
+  ];
+  for (const r of rows) await db.query("INSERT INTO people (name, email, role) VALUES (?, ?, ?)", r);
+
+  const q = TableQuery.parse({ q: "ana", sort: "name", dir: "desc" }, { sortable: ["name"] });
+  const res = await TableQuery.paginate("people", q, { db, searchable: ["name", "email"] });
+  assert.equal(res.total, 2);
+  assert.deepEqual(res.data.map((r) => r.name), ["Carla", "Ana"]);
+
+  const q2 = TableQuery.parse({ f_role: "user", limit: "2", page: "2", sort: "name" }, { sortable: ["name"], filterable: ["role"] });
+  const res2 = await TableQuery.paginate("people", q2, { db, filterable: ["role"] });
+  assert.equal(res2.total, 4);
+  assert.equal(res2.totalPages, 2);
+  assert.deepEqual(res2.data.map((r) => r.name), ["Carla", "Dario"]);
+
+  // LIKE wildcards in the search term are literal
+  const res3 = await TableQuery.paginate("people", { search: "%_" }, { db, searchable: ["name"] });
+  assert.deepEqual(res3.data.map((r) => r.name), ["100%_real"]);
+
+  assert.throws(() => TableQuery.build({}, { table: "people; DROP TABLE x" }), /Invalid table/);
+});
+
+test("make:ui copies components with their dependencies and a barrel", async () => {
+  const { makeUi } = await import("../core/cli/ui.js");
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "seip-ui-"));
+  fs.mkdirSync(path.join(cwd, "src", "app"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "src", "app", "globals.css"), '@import "tailwindcss";\n');
+  fs.writeFileSync(path.join(cwd, "package.json"), JSON.stringify({ devDependencies: { tailwindcss: "^4.1.0" } }));
+
+  const { copied } = makeUi(["datatable", "snackbar"], { cwd, silent: true });
+  for (const f of ["theme.css", "utils.js", "datatable.jsx", "input.jsx", "pagination.jsx", "toast.jsx"]) {
+    assert.ok(copied.includes(f), `${f} should be copied`);
+  }
+  assert.ok(!copied.includes("carousel.jsx"));
+  const barrel = fs.readFileSync(path.join(cwd, "src", "ui", "index.js"), "utf8");
+  assert.match(barrel, /datatable/);
+  assert.doesNotMatch(barrel, /carousel/);
+  assert.match(fs.readFileSync(path.join(cwd, "src", "app", "globals.css"), "utf8"), /@import "..\/ui\/theme.css";/);
+  assert.ok(fs.existsSync(path.join(cwd, "postcss.config.mjs")));
+
+  // Second run does not overwrite user edits
+  fs.writeFileSync(path.join(cwd, "src", "ui", "button.jsx"), "// mine");
+  const again = makeUi(["button"], { cwd, silent: true });
+  assert.ok(again.skipped.includes("button.jsx"));
+  assert.equal(fs.readFileSync(path.join(cwd, "src", "ui", "button.jsx"), "utf8"), "// mine");
+  assert.throws(() => makeUi(["nope"], { cwd, silent: true }), /desconocido/);
+});

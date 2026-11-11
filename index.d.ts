@@ -115,7 +115,7 @@ export class Auth {
       cookieStore?: any;
       secret?: string;
     }
-  ): Promise<{ token: string; cookie: any }>;
+  ): Promise<{ token: string; cookie: any; cookieSet: boolean }>;
   static logout(options?: { cookieKey?: string; cookieStore?: any }): Promise<boolean>;
 }
 
@@ -205,6 +205,9 @@ export class IA {
 
 export function escapeXss(value: any): string;
 
+/** Registers an already-imported optional dependency (bcrypt, pg, mysql2/promise, better-sqlite3, multer, ws). */
+export function registerModule(name: string, mod: any): void;
+
 export class Validator {
   constructor(schema?: Record<string, any>, lang_default?: string, messages?: any);
   validate(input: any, langOverride?: string): Promise<{
@@ -249,6 +252,58 @@ export class Upload {
   static url(filename: string, folder?: string): string;
   /** Serves an uploaded file from a Route Handler (runtime uploads are not served by `next start`). */
   static serve(relativePath: string | string[], options?: { folder?: string; cacheControl?: string }): Promise<Response>;
+}
+
+export interface TableQueryState {
+  page: number;
+  limit: number;
+  search: string;
+  sort: string | null;
+  dir: "asc" | "desc";
+  filters: Record<string, string>;
+}
+
+export class TableQuery {
+  /** Parses ?q=&page=&limit=&sort=&dir=&f_<col>= against your whitelists. */
+  static parse(
+    searchParams: URLSearchParams | Record<string, string | string[] | undefined>,
+    config?: {
+      sortable?: string[];
+      filterable?: string[];
+      defaultSort?: string;
+      defaultDir?: "asc" | "desc";
+      defaultLimit?: number;
+      maxLimit?: number;
+    }
+  ): TableQueryState;
+  static build(
+    query: Partial<TableQueryState>,
+    options: {
+      table: string;
+      select?: string;
+      searchable?: string[];
+      sortable?: string[];
+      filterable?: string[];
+      where?: { sql: string; params?: any[] };
+      dialect?: string;
+      softDelete?: boolean;
+    }
+  ): { sql: string; params: any[] };
+  static paginate<T = any>(
+    source: typeof Model | string,
+    query: Partial<TableQueryState>,
+    options?: {
+      searchable?: string[];
+      sortable?: string[];
+      filterable?: string[];
+      select?: string;
+      where?: { sql: string; params?: any[] };
+      db?: Database;
+      maxLimit?: number;
+      withDeleted?: boolean;
+      withHidden?: boolean;
+    }
+  ): Promise<PaginateResult<T> & { query: Partial<TableQueryState> }>;
 }
 
 export class Seo {
@@ -317,6 +372,8 @@ declare const _default: {
   Seo: typeof Seo;
   WebSocketManager: typeof WebSocketManager;
   colors: typeof colors;
+  registerModule: typeof registerModule;
+  TableQuery: typeof TableQuery;
 };
 
 export default _default;

@@ -21,6 +21,7 @@ const { makeEcosystem } = await import("../core/cli/ecosystem.js");
 const { generateNginxConfig } = await import("../core/cli/nginx.js");
 const { makeDesktop } = await import("../core/cli/desktop.js");
 const { makeSeo } = await import("../core/cli/seo.js");
+const { makeUi } = await import("../core/cli/ui.js");
 const { Database } = await import("../core/database.js");
 
 const args = process.argv.slice(2);
@@ -44,8 +45,9 @@ function showHelp() {
   console.log(colors.green("  seed [--force]            ") + colors.gray("Ejecuta los seeds pendientes (--force re-ejecuta todos)"));
   console.log(colors.green("  make:ecosystem            ") + colors.gray("Genera ecosystem.config.cjs para PM2 en VPS"));
   console.log(colors.green("  nginx:conf [domain]       ") + colors.gray("Genera configuración Nginx y comandos Certbot"));
-  console.log(colors.green("  make:desktop              ") + colors.gray("Scaffold de Nextron/Electron (Win, Mac, Linux, Portable)"));
+  console.log(colors.green("  make:desktop              ") + colors.gray("Scaffold de Electron (Win, Mac, Linux, Portable)"));
   console.log(colors.green("  make:seo                  ") + colors.gray("Genera sitemap.xml y robots.txt con filtro"));
+  console.log(colors.green("  make:ui [comp...] [--force]") + colors.gray(" Copia componentes UI (Tailwind v4) a src/ui (--list, --dir=ruta)"));
   console.log(colors.green("  ws:start [port] [--auth]   ") + colors.gray("Inicia el servidor WebSocket independiente (--auth exige token)"));
   console.log("");
 }
@@ -101,6 +103,16 @@ async function run() {
     case "make:desktop":
     case "desktop": {
       makeDesktop();
+      break;
+    }
+    case "make:ui":
+    case "ui": {
+      const dirArg = args.find((arg) => arg.startsWith("--dir="));
+      makeUi(positional, {
+        force: args.includes("--force"),
+        list: args.includes("--list"),
+        dir: dirArg ? dirArg.slice("--dir=".length) : undefined,
+      });
       break;
     }
     case "make:seo":

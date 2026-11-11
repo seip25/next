@@ -4,7 +4,7 @@ import colors from "../util/colors.js";
 import { parseEnv } from "./ecosystem.js";
 
 /**
- * Scaffolds Nextron / Electron desktop integration with multi-platform build support
+ * Scaffolds Electron desktop integration with multi-platform build support
  * (Windows NSIS, Windows Portable, macOS zip, Linux AppImage/tar.gz).
  */
 export function makeDesktop() {
@@ -23,21 +23,27 @@ export function makeDesktop() {
   fs.mkdirSync(mainDir, { recursive: true });
 
   // 1. desktop/package.json
+  // Plain Electron + electron-builder: the UI is the Next.js standalone server, so there is no
+  // Nextron "renderer/" app (nextron build would run `next build renderer` and fail).
   const desktopPkg = {
     name: `${appName}-desktop`,
-    version: "1.0.0",
+    version: env.VERSION || "1.0.0",
     description: `${appName} Desktop Edition (Windows, macOS, Linux)`,
     main: "main/background.js",
     type: "module",
+    private: true,
     scripts: {
       "prepare:server": "node scripts/prepare-server.js",
-      dev: "node scripts/prepare-server.js && nextron",
-      build: "node scripts/prepare-server.js && nextron build",
-      "build:win": "node scripts/prepare-server.js && nextron build --win --x64",
-      "build:portable": "node scripts/prepare-server.js && nextron build --win portable --x64",
-      "build:mac": "node scripts/prepare-server.js && nextron build --mac zip",
-      "build:linux": "node scripts/prepare-server.js && nextron build --linux AppImage tar.gz",
-      "build:all": "node scripts/prepare-server.js && nextron build --win --mac --linux",
+      // dev: run `npm run dev` in the project root first; Electron loads DEV_URL (http://localhost:3000).
+      dev: "electron .",
+      // Prueba local del servidor empaquetado (desktop/server) sin generar instalador.
+      start: "node scripts/prepare-server.js && cross-env DESKTOP_SERVER=local electron .",
+      build: "node scripts/prepare-server.js && electron-builder",
+      "build:win": "node scripts/prepare-server.js && electron-builder --win nsis --x64",
+      "build:portable": "node scripts/prepare-server.js && electron-builder --win portable --x64",
+      "build:mac": "node scripts/prepare-server.js && electron-builder --mac zip",
+      "build:linux": "node scripts/prepare-server.js && electron-builder --linux AppImage tar.gz",
+      "build:all": "node scripts/prepare-server.js && electron-builder --win --mac --linux",
     },
     build: {
       appId: `com.seip.${appName}`,
@@ -46,15 +52,16 @@ export function makeDesktop() {
         output: "dist",
       },
       files: ["main/**/*", "package.json"],
+      // The Next.js server and the DB template live OUTSIDE app.asar (real files on disk).
       extraResources: [
-        {
-          from: "database",
-          to: "database",
-          filter: ["**/*", "!**/*-wal", "!**/*-shm"],
-        },
         {
           from: "server",
           to: "server",
+          filter: ["**/*", "!**/*-wal", "!**/*-shm", "!**/.env*.local"],
+        },
+        {
+          from: "database",
+          to: "database",
           filter: ["**/*", "!**/*-wal", "!**/*-shm"],
         },
       ],
@@ -69,6 +76,7 @@ export function makeDesktop() {
       },
       linux: {
         target: ["AppImage", "tar.gz"],
+        category: "Utility",
       },
       nsis: {
         oneClick: false,
@@ -82,13 +90,13 @@ export function makeDesktop() {
         artifactName: "${productName}-Portable-${version}.${ext}",
       },
       asar: true,
-      asarUnpack: ["database/**/*"],
     },
     dependencies: {},
     devDependencies: {
-      electron: "^34.0.0",
-      "electron-builder": "^25.1.8",
-      nextron: "^10.0.0",
+      // Electron >= 35 ships Node 22+, required for the native node:sqlite driver (zero native addons).
+      electron: "^45.0.0",
+      "electron-builder": "^26.0.0",
+      "cross-env": "^10.0.0",
     },
   };
 
@@ -108,123 +116,246 @@ const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, "..", "..");
 const standaloneDir = path.join(rootDir, ".next", "standalone");
 const destServerDir = path.resolve(__dirname, "..", "server");
+const destDbDir = path.resolve(__dirname, "..", "database");
 
 console.log("[PREPARE] Preparando servidor standalone de Next.js para Desktop...");
 
-if (!fs.existsSync(standaloneDir)) {
-  console.error("[PREPARE ERROR] .next/standalone no existe.");
-  console.log("Por favor asegúrate de tener en next.config.js: output: 'standalone'");
+if (!fs.existsSync(path.join(standaloneDir, "server.js"))) {
+  console.error("[PREPARE ERROR] .next/standalone/server.js no existe.");
+  console.log("Asegúrate de tener en next.config: output: 'standalone'");
   console.log("Y ejecuta 'npm run build' en la raíz antes de empaquetar desktop.");
   process.exit(1);
 }
 
-// 1. Asegurar static en standalone/.next/static
-const rootStaticDir = path.join(rootDir, ".next", "static");
-const standaloneStaticDir = path.join(standaloneDir, ".next", "static");
-if (fs.existsSync(rootStaticDir)) {
-  fs.mkdirSync(standaloneStaticDir, { recursive: true });
-  fs.cpSync(rootStaticDir, standaloneStaticDir, { recursive: true });
+// 1. static y public (Next no los copia al standalone)
+const copies = [
+  [path.join(rootDir, ".next", "static"), path.join(standaloneDir, ".next", "static")],
+  [path.join(rootDir, "public"), path.join(standaloneDir, "public")],
+];
+for (const [from, to] of copies) {
+  if (fs.existsSync(from)) {
+    fs.mkdirSync(to, { recursive: true });
+    fs.cpSync(from, to, { recursive: true });
+  }
 }
 
-// 2. Asegurar public/ en standalone/public
-const rootPublicDir = path.join(rootDir, "public");
-const standalonePublicDir = path.join(standaloneDir, "public");
-if (fs.existsSync(rootPublicDir)) {
-  fs.mkdirSync(standalonePublicDir, { recursive: true });
-  fs.cpSync(rootPublicDir, standalonePublicDir, { recursive: true });
-}
-
-// 3. Limpiar desktop/server previo y copiar
-if (fs.existsSync(destServerDir)) {
-  fs.rmSync(destServerDir, { recursive: true, force: true });
-}
+// 2. Limpiar desktop/server previo y copiar
+fs.rmSync(destServerDir, { recursive: true, force: true });
 fs.mkdirSync(destServerDir, { recursive: true });
-
 console.log("[PREPARE] Copiando servidor a desktop/server...");
 fs.cpSync(standaloneDir, destServerDir, { recursive: true, dereference: true });
-console.log("[PREPARE OK] Servidor preparado exitosamente en desktop/server.");
+
+// La base de datos de desarrollo NO se empaqueta dentro del servidor.
+fs.rmSync(path.join(destServerDir, "database"), { recursive: true, force: true });
+
+// 3. Plantilla de base de datos (se copia a userData en el primer arranque).
+//    Genera database/app.db con 'npx seip migrate' (y 'npx seip seed') antes de empaquetar.
+fs.rmSync(destDbDir, { recursive: true, force: true });
+fs.mkdirSync(destDbDir, { recursive: true });
+const dbFile = path.basename(process.env.DB_FILE || "app.db");
+const rootDb = path.join(rootDir, "database", dbFile);
+if (fs.existsSync(rootDb)) {
+  fs.copyFileSync(rootDb, path.join(destDbDir, dbFile));
+  console.log(\`[PREPARE] Plantilla de BD copiada: database/\${dbFile}\`);
+} else {
+  console.warn(\`[PREPARE WARN] No existe database/\${dbFile}: la app arrancará con la BD vacía. Ejecuta 'npx seip migrate'.\`);
+}
+
+// 4. Addons nativos: deben compilarse para el ABI de Electron, no el de Node.
+//    node:sqlite + scrypt (los defaults de @seip/nextjs) no necesitan ninguno.
+const abiSensitive = ["better-sqlite3"];
+for (const name of abiSensitive) {
+  if (fs.existsSync(path.join(destServerDir, "node_modules", name))) {
+    console.warn(
+      \`[PREPARE WARN] '\${name}' es un addon nativo compilado para Node, no para Electron. \` +
+        "Usa el driver nativo node:sqlite (por defecto) o recompílalo con @electron/rebuild."
+    );
+  }
+}
+
+console.log("[PREPARE OK] Servidor preparado en desktop/server.");
 `;
 
   fs.writeFileSync(path.join(scriptsDir, "prepare-server.js"), prepareServerContent, "utf-8");
 
   // 3. desktop/main/background.js
-  const backgroundContent = `import { app, BrowserWindow } from "electron";
+  const backgroundContent = `import { app, BrowserWindow, dialog, shell, utilityProcess } from "electron";
+import fs from "node:fs";
 import path from "node:path";
-import { fork } from "node:child_process";
+import net from "node:net";
 import http from "node:http";
+import { randomBytes } from "node:crypto";
+import { fileURLToPath } from "node:url";
 
-const isProd = process.env.NODE_ENV === "production";
+// NODE_ENV no existe en una app empaquetada: usar app.isPackaged.
+const isPackaged = app.isPackaged;
+const useBundledServer = isPackaged || process.env.DESKTOP_SERVER === "local";
+// Empaquetado: resources/ (extraResources). Local: la carpeta desktop/.
+const resourcesDir = isPackaged
+  ? process.resourcesPath
+  : path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const DEV_URL = process.env.DEV_URL || "http://localhost:3000";
 let serverProcess = null;
 let mainWindow = null;
+let quitting = false;
 
-function findAvailablePort(startPort = 3000) {
-  return new Promise((resolve) => {
-    const server = http.createServer();
-    server.listen(startPort, () => {
-      const port = server.address().port;
-      server.close(() => resolve(port));
-    });
-    server.on("error", () => {
-      resolve(findAvailablePort(startPort + 1));
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
+
+/** Puerto libre en 127.0.0.1 elegido por el sistema operativo. */
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.on("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
     });
   });
+}
+
+/** Espera a que el servidor responda en lugar de un setTimeout fijo. */
+function waitForServer(url, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    const attempt = () => {
+      const req = http.get(url, (res) => {
+        res.resume();
+        resolve();
+      });
+      req.on("error", () => {
+        if (Date.now() > deadline) return reject(new Error("El servidor Next.js no respondió a tiempo."));
+        setTimeout(attempt, 150);
+      });
+      req.setTimeout(2000, () => req.destroy());
+    };
+    attempt();
+  });
+}
+
+/** JWT_SECRET único por instalación, guardado en userData (nunca dentro del instalador). */
+function installSecret(userDataDir) {
+  const file = path.join(userDataDir, ".jwt-secret");
+  try {
+    return fs.readFileSync(file, "utf8").trim();
+  } catch {
+    const secret = randomBytes(48).toString("hex");
+    fs.mkdirSync(userDataDir, { recursive: true });
+    fs.writeFileSync(file, secret, { mode: 0o600 });
+    return secret;
+  }
+}
+
+/** Copia la plantilla de BD empaquetada a userData en el primer arranque. */
+function ensureDatabase(userDataDir) {
+  const templateDir = path.join(resourcesDir, "database");
+  const targetDir = path.join(userDataDir, "database");
+  if (!fs.existsSync(templateDir)) return;
+  fs.mkdirSync(targetDir, { recursive: true });
+  for (const file of fs.readdirSync(templateDir)) {
+    const target = path.join(targetDir, file);
+    if (!fs.existsSync(target)) fs.copyFileSync(path.join(templateDir, file), target);
+  }
 }
 
 async function startServer() {
-  const port = await findAvailablePort(3000);
-  const serverPath = isProd
-    ? path.join(process.resourcesPath, "server", "server.js")
-    : path.resolve(process.cwd(), "..", ".next", "standalone", "server.js");
-
   const userDataDir = app.getPath("userData");
+  ensureDatabase(userDataDir);
 
-  serverProcess = fork(serverPath, [], {
+  const port = await freePort();
+  const serverDir = path.join(resourcesDir, "server");
+
+  // utilityProcess usa el Node embebido de Electron (no hace falta ELECTRON_RUN_AS_NODE).
+  serverProcess = utilityProcess.fork(path.join(serverDir, "server.js"), [], {
+    cwd: serverDir,
+    serviceName: "next-server",
+    stdio: "inherit",
     env: {
       ...process.env,
+      NODE_ENV: "production",
       PORT: String(port),
-      HOST: "127.0.0.1",
+      // El server.js standalone de Next lee HOSTNAME (no HOST). Sin esto escucha en 0.0.0.0.
+      HOSTNAME: "127.0.0.1",
       DESKTOP_MODE: "true",
       USER_DATA_PATH: userDataDir,
+      JWT_SECRET: process.env.JWT_SECRET || installSecret(userDataDir),
     },
-    stdio: "inherit",
   });
 
-  return port;
+  serverProcess.on("exit", (code) => {
+    serverProcess = null;
+    if (!quitting) {
+      dialog.showErrorBox("Error", \`El servidor interno se detuvo (código \${code}).\`);
+      app.quit();
+    }
+  });
+
+  const url = \`http://127.0.0.1:\${port}\`;
+  await waitForServer(url);
+  return url;
 }
 
-app.whenReady().then(async () => {
-  const port = await startServer();
-  const url = \`http://127.0.0.1:\${port}\`;
-
+function createWindow(url) {
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 800,
+    show: false,
+    autoHideMenuBar: true,
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      sandbox: true,
     },
   });
 
-  // Wait for local server to be responsive
-  setTimeout(() => {
-    mainWindow.loadURL(url);
-  }, 1000);
+  // Links externos (target=_blank / window.open) en el navegador del sistema.
+  mainWindow.webContents.setWindowOpenHandler(({ url: target }) => {
+    if (/^https?:/i.test(target)) shell.openExternal(target);
+    return { action: "deny" };
+  });
+  mainWindow.webContents.on("will-navigate", (event, target) => {
+    if (!target.startsWith(url)) {
+      event.preventDefault();
+      if (/^https?:/i.test(target)) shell.openExternal(target);
+    }
+  });
 
+  mainWindow.once("ready-to-show", () => mainWindow.show());
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
+  mainWindow.loadURL(url);
+}
+
+app.whenReady().then(async () => {
+  try {
+    const url = useBundledServer ? await startServer() : DEV_URL;
+    createWindow(url);
+    app.on("activate", () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow(url);
+    });
+  } catch (err) {
+    dialog.showErrorBox("Error al iniciar", String(err?.message || err));
+    app.quit();
+  }
 });
 
 app.on("before-quit", () => {
-  if (serverProcess) {
-    serverProcess.kill();
-  }
+  quitting = true;
+  if (serverProcess) serverProcess.kill();
 });
 
 app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") {
-    app.quit();
-  }
+  if (process.platform !== "darwin") app.quit();
 });
 `;
 
@@ -239,8 +370,8 @@ app.on("window-all-closed", () => {
   console.log(colors.bold("Pasos para compilar la versión de escritorio:"));
   console.log(colors.yellow("1. Asegúrate de configurar en tu next.config.js:"));
   console.log(colors.white("   output: 'standalone'"));
-  console.log(colors.yellow("2. Compila Next.js en la raíz:"));
-  console.log(colors.white("   npm run build"));
+  console.log(colors.yellow("2. Genera la plantilla de BD y compila Next.js en la raíz:"));
+  console.log(colors.white("   npx seip migrate && npm run build"));
   console.log(colors.yellow("3. Ve a desktop/ e instala dependencias:"));
   console.log(colors.white("   cd desktop && npm install"));
   console.log(colors.yellow("4. Compila para el objetivo deseado:"));

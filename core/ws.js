@@ -1,15 +1,16 @@
 import http from "node:http";
 import { randomUUID } from "node:crypto";
 import Auth from "./auth.js";
+import { importOptional } from "./util/optional.js";
 
 let WebSocketServer = null;
 let WebSocket = null;
 
-try {
-  const wsModule = await import("ws");
+const wsModule = await importOptional("ws");
+if (wsModule) {
   WebSocketServer = wsModule.WebSocketServer || wsModule.default?.WebSocketServer;
   WebSocket = wsModule.WebSocket || wsModule.default?.WebSocket;
-} catch {}
+}
 
 /**
  * Standalone or embedded WebSocket Server Manager for VPS PM2 deployments and Electron.
