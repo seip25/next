@@ -1,1 +1,1 @@
-export { Model, Model as default, SchemaField } from "../index.d.ts";
+export { Model, Model as default, SchemaField } from "../index.js";

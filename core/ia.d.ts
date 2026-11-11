@@ -1,1 +1,1 @@
-export { IA, IA as default } from "../index.d.ts";
+export { IA, IA as default } from "../index.js";

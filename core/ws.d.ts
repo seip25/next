@@ -1,1 +1,1 @@
-export { WebSocketManager, WebSocketManager as default } from "../index.d.ts";
+export { WebSocketManager, WebSocketManager as default } from "../index.js";

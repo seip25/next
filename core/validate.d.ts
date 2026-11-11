@@ -1,1 +1,1 @@
-export { Validator, Validator as default, escapeXss } from "../index.d.ts";
+export { Validator, Validator as default, escapeXss } from "../index.js";

@@ -1,1 +1,1 @@
-export { Upload, Upload as default } from "../index.d.ts";
+export { Upload, Upload as default } from "../index.js";

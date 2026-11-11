@@ -1,1 +1,1 @@
-export { Config, Config as default } from "../index.d.ts";
+export { Config, Config as default } from "../index.js";

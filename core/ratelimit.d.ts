@@ -1,1 +1,1 @@
-export { RateLimit, RateLimit as default } from "../index.d.ts";
+export { RateLimit, RateLimit as default } from "../index.js";

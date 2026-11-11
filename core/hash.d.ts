@@ -1,1 +1,1 @@
-export { Hash, Hash as default } from "../index.d.ts";
+export { Hash, Hash as default } from "../index.js";
