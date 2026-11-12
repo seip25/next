@@ -52,6 +52,7 @@ npm install @seip/nextjs
 - [Despliegue en VPS](#-despliegue-en-vps-pm2--nginx)
 - [Aplicación de escritorio](#-aplicación-de-escritorio-electron)
 - [Next.js 16: compatibilidad y solución de problemas](#-nextjs-16-compatibilidad-y-solución-de-problemas)
+- [Novedades 0.0.5](#-novedades-005)
 - [Novedades 0.0.4](#-novedades-004)
 
 ---
@@ -559,6 +560,23 @@ export async function GET() {
 
 Para clientes de API (apps móviles, scripts), devuelve el `token` de `Auth.login()` en el body y
 envíalo como `Authorization: Bearer <token>`.
+
+**Con `cacheComponents: true`** no hace falta nada especial: `Auth.user()` lee `cookies()`/`headers()`
+(eso marca la ruta como dinámica) y llama a `connection()` antes de verificar el token, así Next no
+se queja del `Date.now()` de la expiración. Pon el componente que usa `Auth.user()` dentro de un
+`<Suspense>` y no lo llames dentro de `"use cache"`. Si tienes tu propio `try/catch` alrededor,
+deja pasar los errores internos de Next:
+
+```javascript
+import { Auth, isNextInternalError } from "@seip/nextjs/auth";
+
+try {
+  user = await Auth.user();
+} catch (err) {
+  if (isNextInternalError(err)) throw err; // o unstable_rethrow(err) de next/navigation
+  // ...tu manejo de errores
+}
+```
 
 ### 4. Roles
 
@@ -1643,6 +1661,9 @@ documentación de electron-builder.
 | `ExperimentalWarning: SQLite is an experimental feature` | Aviso de Node sobre `node:sqlite` | Informativo, no afecta. |
 | Archivos subidos dan 404 | `next start` no sirve archivos nuevos de `public/` | Usa nginx o la ruta `Upload.serve`. |
 | Server Action con archivos falla por tamaño | Límite de 1 MB | `experimental.serverActions.bodySizeLimit`. |
+| `[AUTH WARNING] ... cookies() is not available here` durante `next build` con `cacheComponents` | 0.0.4 tomaba el error intencional del prerender (`HANGING_PROMISE_REJECTION`) como falta de contexto | Actualiza a 0.0.5. El aviso era falso: la ruta ya se clasificaba como dinámica. |
+| `used Date.now() before accessing uncached data` en una ruta con `Auth.user()` | Prerender con `cacheComponents` | Actualiza a 0.0.5 (llama a `connection()` por ti), o pon `await connection()` antes. |
+| `revalidateTag` con un argumento está deprecado | Next 16 pide perfil | Usa `revalidateTag(tag, "max")` en tu código; `Model` ya lo hace. |
 | `[AUTH ERROR] JWT_SECRET is not configured` | Falta la variable | Defínela (32+ caracteres en producción). |
 | `useConfirm() requires <ConfirmProvider>` | Falta el provider | Envuelve el layout con `<UIProvider>`. |
 | Los componentes UI se ven sin estilos | `theme.css` no importado o Tailwind v3 | `@import "tailwindcss"; @import "../ui/theme.css";` y Tailwind v4. |
@@ -1654,6 +1675,21 @@ Notas para Next 16:
   `TableQuery.parse`.
 - `revalidateTag(tag, "max")` se usa internamente (perfil requerido en Next 16).
 - Turbopack es el bundler por defecto en `dev` y `build`: el paquete compila sin configuración.
+
+---
+
+## 🆕 Novedades 0.0.5
+
+**Correcciones**
+- `next build` con `cacheComponents` ya no muestra un `[AUTH WARNING] ... cookies() is not available here`
+  falso en rutas que usan `Auth.user()`, `Auth.login()` o `Auth.logout()`. Los errores internos de
+  Next (`DYNAMIC_SERVER_USAGE`, `HANGING_PROMISE_REJECTION`, redirect/notFound, postpone) se vuelven a
+  lanzar sin tocarlos, para que Next los maneje.
+- `Auth.user()` llama a `connection()` antes de verificar el token, así Next no registra el
+  `Date.now()` de la verificación durante un prerender. Fuera de Next no hace nada.
+
+**Nuevo**
+- `isNextInternalError(err)` en `@seip/nextjs/auth`, para tus propios `try/catch`.
 
 ---
 

@@ -587,6 +587,54 @@ test("Auth.user(request) accepts Authorization: Bearer like handleProxy", async 
 });
 
 // ---------------------------------------------------------------------------
+// 0.0.5: cacheComponents prerender
+// ---------------------------------------------------------------------------
+
+test("isNextInternalError recognizes Next.js control-flow errors by digest", async () => {
+  const { isNextInternalError } = await import("../core/auth.js");
+  const withDigest = (digest) => Object.assign(new Error("x"), { digest });
+  for (const d of [
+    "DYNAMIC_SERVER_USAGE",
+    "HANGING_PROMISE_REJECTION",
+    "NEXT_PRERENDER_INTERRUPTED",
+    "BAILOUT_TO_CLIENT_SIDE_RENDERING",
+    "NEXT_REDIRECT;replace;/login;307;",
+    "NEXT_HTTP_ERROR_FALLBACK;404",
+  ]) {
+    assert.equal(isNextInternalError(withDigest(d)), true, d);
+  }
+  assert.equal(isNextInternalError({ $$typeof: Symbol.for("react.postpone") }), true);
+  assert.equal(isNextInternalError(new Error("cookies was called outside a request scope")), false);
+  assert.equal(isNextInternalError(withDigest("123456789")), false);
+  assert.equal(isNextInternalError(null), false);
+});
+
+test("Auth.logout/user rethrow Next.js prerender bail-outs without the false [AUTH WARNING]", async () => {
+  const bailout = Object.assign(new Error("During prerendering, cookies() rejects"), {
+    digest: "HANGING_PROMISE_REJECTION",
+  });
+  const store = {
+    get() {
+      throw bailout;
+    },
+    set() {
+      throw bailout;
+    },
+  };
+  const warnings = [];
+  const { warn } = console;
+  console.warn = (msg) => warnings.push(String(msg));
+  try {
+    await assert.rejects(Auth.logout({ cookieStore: store }), (e) => e === bailout);
+    await assert.rejects(Auth.user(store), (e) => e === bailout);
+    await assert.rejects(Auth.login({ id: 1 }, { cookieStore: store }), (e) => e === bailout);
+  } finally {
+    console.warn = warn;
+  }
+  assert.deepEqual(warnings, []);
+});
+
+// ---------------------------------------------------------------------------
 // TableQuery + make:ui
 // ---------------------------------------------------------------------------
 

@@ -152,12 +152,48 @@ function warnNoRequestContext(op, err) {
   );
 }
 
+const NEXT_INTERNAL_DIGESTS = new Set([
+  "DYNAMIC_SERVER_USAGE", // cookies()/headers() during static generation → route is dynamic
+  "HANGING_PROMISE_REJECTION", // cacheComponents: request data rejects when the prerender ends
+  "NEXT_PRERENDER_INTERRUPTED",
+  "BAILOUT_TO_CLIENT_SIDE_RENDERING",
+]);
+const REACT_POSTPONE = Symbol.for("react.postpone");
+
+/**
+ * True for the control-flow errors Next.js throws on purpose (dynamic bail-out, prerender abort,
+ * redirect/notFound, PPR postpone). They must be rethrown untouched so Next can handle them:
+ * catching them logged a false "[AUTH WARNING]" during `next build` with cacheComponents.
+ * Same contract as `unstable_rethrow` from next/navigation, without depending on it.
+ * @param {any} err
+ * @returns {boolean}
+ */
+function isNextInternalError(err) {
+  if (!err || (typeof err !== "object" && typeof err !== "function")) return false;
+  if (err.$$typeof === REACT_POSTPONE) return true;
+  const digest = typeof err.digest === "string" ? err.digest : "";
+  if (!digest) return false;
+  if (NEXT_INTERNAL_DIGESTS.has(digest)) return true;
+  return (
+    digest.startsWith("NEXT_REDIRECT") ||
+    digest.startsWith("NEXT_HTTP_ERROR_FALLBACK") ||
+    digest === "NEXT_NOT_FOUND"
+  );
+}
+
+/** Rethrows Next.js internal errors; returns normally for anything else. */
+function rethrowNextInternal(err) {
+  if (isNextInternalError(err)) throw err;
+  if (err?.cause && isNextInternalError(err.cause)) throw err.cause;
+}
+
 /** @returns {Promise<any|null>} next/headers cookie store for the current request, or null. */
 async function requestCookieStore(op) {
   try {
     const { cookies } = await import("next/headers");
     return await cookies();
   } catch (err) {
+    rethrowNextInternal(err);
     warnNoRequestContext(op, err);
     return null;
   }
@@ -168,8 +204,24 @@ async function requestBearerToken() {
   try {
     const { headers } = await import("next/headers");
     return bearerFrom(await headers());
-  } catch {
+  } catch (err) {
+    rethrowNextInternal(err);
     return null;
+  }
+}
+
+/**
+ * Marks the render as request-time before reading the clock in verifyToken. With cacheComponents,
+ * Next reports `Date.now()` used during a prerender unless request data or connection() came first.
+ * Best effort: outside Next.js, inside "use cache" or in proxy.js it is a no-op.
+ */
+async function awaitConnection() {
+  if (!process.env.NEXT_RUNTIME) return;
+  try {
+    const { connection } = await import("next/server");
+    if (typeof connection === "function") await connection();
+  } catch (err) {
+    rethrowNextInternal(err);
   }
 }
 
@@ -213,6 +265,7 @@ async function writeCookie(op, cookieStore, cookieOptions) {
     await store.set(cookieOptions);
     return true;
   } catch (err) {
+    rethrowNextInternal(err);
     warnNoRequestContext(op, err);
     return false;
   }
@@ -453,7 +506,9 @@ class Auth {
       if (!token) token = await requestBearerToken();
     }
 
-    return token ? this.verifyToken(token) : null;
+    if (!token) return null;
+    await awaitConnection();
+    return this.verifyToken(token);
   }
 
   /**
@@ -527,7 +582,8 @@ class Auth {
         token = store?.get(cookieKey)?.value || null;
       }
       if (token) this.revoke(token);
-    } catch {
+    } catch (err) {
+      rethrowNextInternal(err);
       // Cookie store unavailable: still clear the cookie below.
     }
 
@@ -542,5 +598,5 @@ class Auth {
   }
 }
 
-export { Auth };
+export { Auth, isNextInternalError };
 export default Auth;
